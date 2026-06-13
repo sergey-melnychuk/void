@@ -5,7 +5,8 @@
 // It is carried to the server in the WebSocket subprotocol and an
 // Authorization header — never in a URL — so it stays out of access logs.
 
-import { createApp, reactive, computed, onMounted } from 'vue'
+import { createApp, reactive, computed, onMounted, nextTick } from 'vue'
+import QRCode from 'qrcode'
 
 // ── Reactive room store (mirrors VOID.md store shape) ─────────────────────
 const room = reactive({
@@ -16,7 +17,12 @@ const room = reactive({
   messages: [],
   questions: [],
   polls: [],
+  pendingMessages: [],
+  pendingQuestions: [],
 })
+
+// Locally-submitted items awaiting moderation: { id, text, status: 'pending'|'rejected' }
+const myPending = reactive({ messages: [], questions: [] })
 
 const REACTIONS = ['👍', '❤️', '😂', '🔥', '🤔']
 
@@ -47,6 +53,10 @@ function applySnapshot(s) {
   room.messages = s.messages ?? []
   room.questions = s.questions ?? []
   room.polls = s.polls ?? []
+  room.pendingMessages = s.pending_messages ?? []
+  room.pendingQuestions = s.pending_questions ?? []
+  myPending.messages = []
+  myPending.questions = []
 }
 
 // ── WebSocket lifecycle + server→client event routing ─────────────────────
@@ -62,7 +72,8 @@ const ui = reactive({
   connected: false,
   toast: '',
   tab: 'chat',
-  pollFormOpen: false,
+  pollModalOpen: false,
+  qrOpen: false,
 })
 let lastMessageDraft = '' // restored into the input if a send is rejected
 
@@ -91,14 +102,22 @@ function connect(roomId, token) {
     const p = event.payload ?? {}
     switch (event.type) {
       case 'snapshot':           applySnapshot(p); break
-      case 'message':            pushUnique(room.messages, p); break
+      case 'message':
+        pushUnique(room.messages, p)
+        room.pendingMessages = room.pendingMessages.filter((m) => m.id !== p.id)
+        myPending.messages = myPending.messages.filter((m) => m.id !== p.id)
+        break
       case 'message_deleted':    room.messages = room.messages.filter((m) => m.id !== p.id); break
       case 'reaction': {
         const m = room.messages.find((m) => m.id === p.message_id)
         if (m) { if (p.count > 0) m.reactions[p.emoji] = p.count; else delete m.reactions[p.emoji] }
         break
       }
-      case 'question':           pushUnique(room.questions, p); break
+      case 'question':
+        pushUnique(room.questions, p)
+        room.pendingQuestions = room.pendingQuestions.filter((q) => q.id !== p.id)
+        myPending.questions = myPending.questions.filter((q) => q.id !== p.id)
+        break
       case 'vote': {
         const q = room.questions.find((q) => q.id === p.question_id)
         if (q) q.votes = p.votes
@@ -121,6 +140,27 @@ function connect(roomId, token) {
         if (poll) poll.closed = true
         break
       }
+      case 'poll_deleted':
+        room.polls = room.polls.filter((x) => x.id !== p.poll_id)
+        break
+      case 'pending_message':
+        if (ui.isAdmin) pushUnique(room.pendingMessages, p)
+        else if (!myPending.messages.some((m) => m.id === p.id))
+          myPending.messages.push({ id: p.id, text: p.text, status: 'pending' })
+        break
+      case 'pending_message_rejected':
+        room.pendingMessages = room.pendingMessages.filter((m) => m.id !== p.id)
+        { const m = myPending.messages.find((m) => m.id === p.id); if (m) m.status = 'rejected' }
+        break
+      case 'pending_question':
+        if (ui.isAdmin) pushUnique(room.pendingQuestions, p)
+        else if (!myPending.questions.some((q) => q.id === p.id))
+          myPending.questions.push({ id: p.id, text: p.text, status: 'pending' })
+        break
+      case 'pending_question_rejected':
+        room.pendingQuestions = room.pendingQuestions.filter((q) => q.id !== p.id)
+        { const q = myPending.questions.find((q) => q.id === p.id); if (q) q.status = 'rejected' }
+        break
       case 'lock':               room.locked = p.locked; room.lockedUntil = p.until ?? null; break
       case 'room_closed':
         intentionalClose = true
@@ -167,7 +207,7 @@ let draftRef = null
 // ── Root component ─────────────────────────────────────────────────────────
 const App = {
   setup() {
-    const form = reactive({ ttlHours: 2, password: '', maxParticipants: 100, maxMessages: 200, rateLimit: 3 })
+    const form = reactive({ ttlHours: 2, password: '', maxParticipants: 100, maxMessages: 200, rateLimit: 3, moderated: false })
     const created = reactive({ publicUrl: '', adminUrl: '', roomId: '', secret: '' })
     const joinForm = reactive({ password: '' })
     const draft = reactive({ message: '', question: '' })
@@ -193,6 +233,7 @@ const App = {
           max_participants: Number(form.maxParticipants),
           max_messages: Number(form.maxMessages),
           rate_limit_seconds: Number(form.rateLimit),
+          moderated: form.moderated,
         }),
       })
       if (!res.ok) { ui.error = 'Could not create room'; ui.view = 'error'; return }
@@ -229,6 +270,7 @@ const App = {
 
     // ── enter (admin) ──────────────────────────────────────────────────────
     async function enterAsAdmin(roomId, secret) {
+      created.secret = secret
       room.id = roomId
       const token = await deriveAdminToken(secret, roomId)
       const res = await fetch(`/r/${roomId}/state`, { headers: { Authorization: `Bearer ${token}` } })
@@ -272,7 +314,28 @@ const App = {
       pollForm.options = ['', '']
     }
     function closePoll(id) { send('admin_close_poll', { poll_id: id }) }
+    function deletePoll(id) { send('admin_delete_poll', { poll_id: id }) }
+    function approveMessage(id) { send('admin_approve_message', { message_id: id }) }
+    function rejectMessage(id) { if (confirm('Drop this message?')) send('admin_reject_message', { message_id: id }) }
+    function approveQuestion(id) { send('admin_approve_question', { question_id: id }) }
+    function rejectQuestion(id) { if (confirm('Drop this question?')) send('admin_reject_question', { question_id: id }) }
     function closeRoom() { if (confirm('Close the room for everyone?')) send('admin_close_room') }
+
+    function showQR() {
+      ui.qrOpen = true
+      history.replaceState(null, '', `/r/${room.id}`)
+      nextTick(() => {
+        const canvas = document.getElementById('qr-canvas')
+        if (!canvas) return
+        const url = `${location.protocol}//${location.host}/r/${room.id}`
+        QRCode.toCanvas(canvas, url, { width: Math.min(window.innerWidth, window.innerHeight) * 0.7, margin: 2 })
+      })
+    }
+
+    function hideQR() {
+      ui.qrOpen = false
+      if (ui.isAdmin) history.replaceState(null, '', `/r/${room.id}/${created.secret}`)
+    }
 
     // ── derived ──────────────────────────────────────────────────────────
     const sortedQuestions = computed(() =>
@@ -281,10 +344,11 @@ const App = {
     const pct = (poll, o) => { const t = pollTotal(poll); return t ? Math.round((o.votes / t) * 100) : 0 }
 
     return {
-      room, ui, form, created, joinForm, draft, pollForm, REACTIONS,
+      room, ui, myPending, form, created, joinForm, draft, pollForm, REACTIONS, location,
       createRoom, enterRoom, enterAsUser, sendMessage, react, submitQuestion,
       voteQuestion, votePoll, toggleLock, lockTimed, deleteMessage, pinQuestion,
-      dismissQuestion, addPollOption, removePollOption, createPoll, closePoll, closeRoom,
+      dismissQuestion, addPollOption, removePollOption, createPoll, closePoll, deletePoll, closeRoom,
+      approveMessage, rejectMessage, approveQuestion, rejectQuestion, showQR, hideQR,
       sortedQuestions, pollTotal, pct,
     }
   },
@@ -300,6 +364,12 @@ const App = {
       <div class="field"><label>Max participants</label><input type="number" v-model="form.maxParticipants" /></div>
       <div class="field"><label>Message history cap</label><input type="number" v-model="form.maxMessages" /></div>
       <div class="field"><label>Rate limit (seconds between messages)</label><input type="number" v-model="form.rateLimit" /></div>
+      <div class="field" style="flex-direction:row;align-items:center;gap:.5rem">
+        <input type="checkbox" id="mod" v-model="form.moderated" style="width:auto" />
+        <label for="mod" style="font-size:1rem;color:var(--text)">
+          <span class="tooltip-anchor">Moderated<span class="tooltip-pop">Admin approves every message &amp; question before it's visible to others</span></span>
+        </label>
+      </div>
       <button @click="createRoom">Create room</button>
     </div>
   </div>
@@ -339,9 +409,14 @@ const App = {
   <div v-else class="room">
     <header>
       <span class="brand">VOID</span>
-      <span class="room-code">{{ room.id }}</span>
+      <span class="room-code" @click="showQR" style="cursor:pointer" title="Show QR code">{{ room.id }}</span>
       <span class="badge admin" v-if="ui.isAdmin">[admin]</span>
       <span class="spacer"></span>
+      <template v-if="ui.isAdmin">
+        <button class="ghost header-btn desktop-only" @click="ui.pollModalOpen = true">Poll</button>
+        <button class="ghost header-btn desktop-only lock-btn" @click="toggleLock">{{ room.locked ? 'Unlock' : 'Lock' }}</button>
+        <button class="ghost header-btn desktop-only" style="color:var(--danger);border-color:var(--danger)" @click="closeRoom">Close</button>
+      </template>
       <span class="participants">{{ room.participants }} online</span>
     </header>
 
@@ -350,36 +425,75 @@ const App = {
       <div v-else-if="room.locked" class="lock-banner">🔒 Room is locked — chat is read-only</div>
     </div>
 
+    <div v-if="ui.isAdmin" class="admin-bar">
+      <button class="ghost header-btn" @click="ui.pollModalOpen = true">Poll</button>
+      <button class="ghost header-btn lock-btn" @click="toggleLock">{{ room.locked ? 'Unlock' : 'Lock' }}</button>
+      <button class="ghost header-btn" style="color:var(--danger);border-color:var(--danger)" @click="closeRoom">Close</button>
+    </div>
+
     <nav class="tabs">
-      <button :class="{active: ui.tab==='chat'}" @click="ui.tab='chat'">Chat</button>
-      <button :class="{active: ui.tab==='qa'}" @click="ui.tab='qa'">Q&amp;A</button>
+      <button :class="{active: ui.tab==='chat'}" @click="ui.tab='chat'">Messages</button>
+      <button :class="{active: ui.tab==='qa'}" @click="ui.tab='qa'">Questions</button>
       <button :class="{active: ui.tab==='polls'}" @click="ui.tab='polls'">Polls</button>
     </nav>
 
-    <!-- Chat -->
+    <!-- Messages -->
     <section class="panel" :class="{'hidden-mobile': ui.tab!=='chat'}">
-      <h2>Chat</h2>
+      <h2>Messages</h2>
       <div class="panel-body">
+        <div v-if="ui.isAdmin && room.pendingMessages.length" class="pending-queue">
+          <div class="pending-label">Pending approval</div>
+          <div v-for="m in room.pendingMessages" :key="m.id" class="msg pending-item">
+            <span class="badge user">[user]</span>{{ m.text }}
+            <div style="margin-top:.3rem;display:flex;gap:.4rem">
+              <button class="ghost" style="color:var(--accent);border-color:var(--accent)" @click="approveMessage(m.id)">Approve</button>
+              <button class="ghost" style="color:var(--danger);border-color:var(--danger)" @click="rejectMessage(m.id)">Drop</button>
+            </div>
+          </div>
+        </div>
         <div v-for="m in room.messages" :key="m.id" class="msg">
           <span class="badge" :class="m.role">[{{ m.role }}]</span>{{ m.text }}
           <button v-if="ui.isAdmin" class="ghost" style="padding:0 .3rem;font-size:.7rem" @click="deleteMessage(m.id)">✕</button>
-          <div style="margin-top:.2rem">
-            <button v-for="e in REACTIONS" :key="e" class="ghost" style="padding:0 .3rem" @click="react(m.id, e)">
-              {{ e }}<span v-if="m.reactions[e]" style="color:var(--text-dim)"> {{ m.reactions[e] }}</span>
+          <div style="margin-top:.2rem;display:flex;flex-wrap:wrap;gap:.25rem;align-items:center">
+            <button v-for="e in REACTIONS.filter(e => m.reactions[e])" :key="e" class="ghost reaction" @click="react(m.id, e)">
+              {{ e }} {{ m.reactions[e] }}
             </button>
+            <div class="reaction-picker" style="position:relative;display:inline-block">
+              <button class="ghost reaction add-reaction" @click="m._pick=!m._pick">+</button>
+              <div v-if="m._pick" class="reaction-menu">
+                <button v-for="e in REACTIONS" :key="e" class="ghost reaction" @click="react(m.id, e);m._pick=false">{{ e }}</button>
+              </div>
+            </div>
           </div>
         </div>
       </div>
+      <div v-if="!ui.isAdmin && myPending.messages.length" class="my-pending-wrap">
+        <div v-for="m in myPending.messages" :key="m.id" class="my-pending-item" :class="m.status">
+          {{ m.text }}
+          <span class="my-pending-status">{{ m.status === 'rejected' ? 'dropped' : 'awaiting approval…' }}</span>
+        </div>
+      </div>
       <div class="panel-footer">
-        <input placeholder="Message…" maxlength="500"
-               :disabled="room.locked && !ui.isAdmin" v-model="draft.message" @keyup.enter="sendMessage" />
+        <textarea placeholder="Message…" maxlength="500" rows="3" class="msg-input"
+               :disabled="room.locked && !ui.isAdmin" v-model="draft.message"
+               @keydown.enter.exact.prevent="sendMessage"></textarea>
       </div>
     </section>
 
-    <!-- Q&A -->
+    <!-- Questions -->
     <section class="panel" :class="{'hidden-mobile': ui.tab!=='qa'}">
-      <h2>Q&amp;A</h2>
+      <h2>Questions</h2>
       <div class="panel-body">
+        <div v-if="ui.isAdmin && room.pendingQuestions.length" class="pending-queue">
+          <div class="pending-label">Pending approval</div>
+          <div v-for="q in room.pendingQuestions" :key="q.id" class="msg pending-item">
+            {{ q.text }}
+            <div style="margin-top:.3rem;display:flex;gap:.4rem">
+              <button class="ghost" style="color:var(--accent);border-color:var(--accent)" @click="approveQuestion(q.id)">Approve</button>
+              <button class="ghost" style="color:var(--danger);border-color:var(--danger)" @click="rejectQuestion(q.id)">Drop</button>
+            </div>
+          </div>
+        </div>
         <div v-for="q in sortedQuestions" :key="q.id" class="msg">
           <button class="ghost" style="padding:0 .4rem" :disabled="room.locked && !ui.isAdmin" @click="voteQuestion(q.id)">▲ {{ q.votes }}</button>
           <span v-if="q.pinned" style="color:var(--accent)">📌 </span>{{ q.text }}
@@ -389,32 +503,23 @@ const App = {
           </template>
         </div>
       </div>
+      <div v-if="!ui.isAdmin && myPending.questions.length" class="my-pending-wrap">
+        <div v-for="q in myPending.questions" :key="q.id" class="my-pending-item" :class="q.status">
+          {{ q.text }}
+          <span class="my-pending-status">{{ q.status === 'rejected' ? 'dropped' : 'awaiting approval…' }}</span>
+        </div>
+      </div>
       <div class="panel-footer">
-        <input placeholder="Ask a question…" maxlength="500"
-               :disabled="room.locked && !ui.isAdmin" v-model="draft.question" @keyup.enter="submitQuestion" />
+        <textarea placeholder="Ask a question…" maxlength="500" rows="3" class="msg-input"
+               :disabled="room.locked && !ui.isAdmin" v-model="draft.question"
+               @keydown.enter.exact.prevent="submitQuestion"></textarea>
       </div>
     </section>
 
-    <!-- Polls + Admin -->
+    <!-- Polls -->
     <section class="panel" :class="{'hidden-mobile': ui.tab!=='polls'}">
-      <h2>Polls &amp; Admin</h2>
+      <h2>Polls</h2>
       <div class="panel-body">
-        <!-- Admin: create poll (collapsible, always on top) -->
-        <div v-if="ui.isAdmin" class="poll-form-wrap">
-          <button class="ghost poll-form-toggle" @click="ui.pollFormOpen = !ui.pollFormOpen">
-            New poll <span>{{ ui.pollFormOpen ? '▲' : '▼' }}</span>
-          </button>
-          <div v-if="ui.pollFormOpen" class="poll-form-body">
-            <div class="field"><input placeholder="Question" v-model="pollForm.question" /></div>
-            <div class="field" v-for="(o, i) in pollForm.options" :key="i" style="flex-direction:row;gap:.3rem">
-              <input style="flex:1" :placeholder="'Option ' + (i+1)" v-model="pollForm.options[i]" />
-              <button class="ghost" @click="removePollOption(i)" :disabled="pollForm.options.length<=2">−</button>
-            </div>
-            <button class="ghost" @click="addPollOption" :disabled="pollForm.options.length>=6">+ option</button>
-            <button @click="createPoll" style="margin-left:.4rem">Create poll</button>
-          </div>
-        </div>
-
         <div v-for="p in [...room.polls].reverse()" :key="p.id" class="msg">
           <strong>{{ p.question }}</strong>
           <span v-if="p.closed" style="color:var(--text-dim)"> · closed</span>
@@ -425,18 +530,37 @@ const App = {
             <div style="height:4px;background:var(--accent);border-radius:2px" :style="{width: pct(p, o) + '%'}"></div>
           </div>
           <button v-if="ui.isAdmin && !p.closed" class="ghost" @click="closePoll(p.id)">Close poll</button>
+          <button v-if="ui.isAdmin" class="ghost" style="color:var(--danger);border-color:var(--danger)" @click="deletePoll(p.id)">Delete</button>
         </div>
-      </div>
-
-      <!-- Admin controls -->
-      <div v-if="ui.isAdmin" class="panel-footer">
-        <button class="ghost admin-btn" @click="toggleLock">{{ room.locked ? 'Unlock' : 'Lock' }}</button>
-        <button class="ghost admin-btn" style="color:var(--danger);border-color:var(--danger)" @click="closeRoom">Close room</button>
       </div>
     </section>
 
+    <!-- Poll creation modal -->
+    <div v-if="ui.pollModalOpen" class="modal-overlay" @click.self="ui.pollModalOpen = false">
+      <div class="modal-card">
+        <h2 style="margin-top:0">New poll</h2>
+        <div class="field"><input placeholder="Question" v-model="pollForm.question" /></div>
+        <div class="field" v-for="(o, i) in pollForm.options" :key="i" style="flex-direction:row;gap:.3rem">
+          <input style="flex:1" :placeholder="'Option ' + (i+1)" v-model="pollForm.options[i]" />
+          <button class="ghost" @click="removePollOption(i)" :disabled="pollForm.options.length<=2">−</button>
+        </div>
+        <div style="display:flex;gap:.5rem;margin-top:.5rem">
+          <button class="ghost" @click="addPollOption" :disabled="pollForm.options.length>=6">+ option</button>
+          <button @click="createPoll();ui.pollModalOpen=false" style="margin-left:auto">Create poll</button>
+          <button class="ghost" @click="ui.pollModalOpen=false">Cancel</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Transient toast for server errors (rate limit, locked, etc.) -->
     <div v-if="ui.toast" class="toast">{{ ui.toast }}</div>
+
+    <!-- QR overlay — click anywhere to dismiss -->
+    <div v-if="ui.qrOpen" class="qr-overlay" @click="hideQR()">
+      <canvas id="qr-canvas"></canvas>
+      <div class="qr-url">{{ location.host }}/r/{{ room.id }}</div>
+      <div class="qr-hint">tap anywhere to close</div>
+    </div>
   </div>
   `,
 }

@@ -31,6 +31,7 @@ async fn main() {
             max_participants: state.config.default_max_participants,
             rate_limit_ms: state.config.default_rate_limit_seconds * 1000,
             max_message_length: state.config.max_message_length,
+            moderated: false,
         },
     ));
 

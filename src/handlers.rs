@@ -30,6 +30,7 @@ pub struct CreateRoomReq {
     pub max_participants: Option<usize>,
     pub max_messages: Option<usize>,
     pub rate_limit_seconds: Option<u64>,
+    pub moderated: Option<bool>,
 }
 
 pub async fn create_room(
@@ -45,6 +46,7 @@ pub async fn create_room(
         max_participants: cfg.clamp_max_participants(req.max_participants),
         rate_limit_ms: cfg.clamp_rate_limit(req.rate_limit_seconds) * 1000,
         max_message_length: cfg.max_message_length,
+        moderated: req.moderated.unwrap_or(false),
     };
 
     let password_hash = match req.password.as_deref().filter(|p| !p.is_empty()) {

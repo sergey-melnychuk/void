@@ -73,6 +73,7 @@ pub struct RoomConfig {
     pub max_participants: usize,
     pub rate_limit_ms: u64,
     pub max_message_length: usize,
+    pub moderated: bool,
 }
 
 pub struct Room {
@@ -84,6 +85,8 @@ pub struct Room {
     pub cfg: RoomConfig,
     /// Broadcast channel: serialized server→client event JSON strings.
     pub tx: broadcast::Sender<String>,
+    /// Admin-only channel: pending item notifications, invisible to regular users.
+    pub admin_tx: broadcast::Sender<String>,
     pub inner: Mutex<RoomInner>,
 }
 
@@ -92,6 +95,9 @@ pub struct RoomInner {
     pub messages: VecDeque<Message>,
     pub questions: Vec<Question>,
     pub polls: Vec<Poll>,
+
+    pub pending_messages: Vec<Message>,
+    pub pending_questions: Vec<Question>,
 
     pub locked: bool,
     pub locked_until: Option<u64>, // epoch ms, for timed locks
@@ -130,6 +136,7 @@ impl Room {
         // Generous buffer so a briefly-slow client at the 200-user target does
         // not lag out of the ring (and if one does, it resyncs — see ws.rs).
         let (tx, _rx) = broadcast::channel(1024);
+        let (admin_tx, _arx) = broadcast::channel(256);
         Arc::new(Room {
             id,
             secret,
@@ -137,6 +144,7 @@ impl Room {
             expires_at: now_ms().saturating_add(ttl_seconds.saturating_mul(1000)),
             cfg,
             tx,
+            admin_tx,
             inner: Mutex::new(RoomInner::default()),
         })
     }
@@ -158,6 +166,11 @@ impl Room {
         let _ = self.tx.send(event.to_string());
     }
 
+    /// Broadcast an event only to admin connections.
+    pub fn broadcast_admin(&self, event: Value) {
+        let _ = self.admin_tx.send(event.to_string());
+    }
+
     /// Lock the room, run `f`, release the lock, then broadcast whatever event
     /// `f` returns (if any). Keeps the lock-mutate-broadcast pattern in one
     /// place and guarantees the mutex is never held across the send.
@@ -174,10 +187,9 @@ impl Room {
         }
     }
 
-    /// Build the room state snapshot (sent as the first WS frame and returned
-    /// by `GET /r/:id/state`).
+    /// Build the admin state snapshot (returned by `GET /r/:id/state`).
     pub fn snapshot(&self) -> Value {
-        self.inner.lock().unwrap().snapshot(&self.id)
+        self.inner.lock().unwrap().snapshot_for(&self.id, true)
     }
 }
 
@@ -189,17 +201,25 @@ impl RoomInner {
     }
 
     pub fn snapshot(&self, room_id: &str) -> Value {
+        self.snapshot_for(room_id, false)
+    }
+
+    pub fn snapshot_for(&self, room_id: &str, is_admin: bool) -> Value {
         let locked = self.effective_locked();
-        json!({
+        let mut v = json!({
             "id": room_id,
             "locked": locked,
-            // Don't advertise a stale deadline once the lock has lazily expired.
             "locked_until": if locked { self.locked_until } else { None },
             "participants": self.participants,
             "messages": self.messages.iter().collect::<Vec<_>>(),
             "questions": self.questions,
             "polls": self.polls,
-        })
+        });
+        if is_admin {
+            v["pending_messages"] = json!(self.pending_messages);
+            v["pending_questions"] = json!(self.pending_questions);
+        }
+        v
     }
 
     pub fn next_msg_id(&mut self) -> u64 {

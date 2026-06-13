@@ -97,7 +97,7 @@ async fn handle_socket(
             return; // socket dropped → connection closed
         }
         inner.participants += 1;
-        (inner.snapshot(&room.id), inner.participants)
+        (inner.snapshot_for(&room.id, is_admin), inner.participants)
     };
 
     let (mut sink, mut stream) = socket.split();
@@ -112,6 +112,18 @@ async fn handle_socket(
     broadcast_participants(&room, count);
 
     let (ptx, mut prx) = mpsc::unbounded_channel::<String>();
+
+    // Admin connections receive pending-item notifications via admin_tx.
+    // Bridge admin_tx → ptx so the existing outbound pump handles delivery.
+    if is_admin {
+        let mut admin_rx = room.admin_tx.subscribe();
+        let ptx2 = ptx.clone();
+        tokio::spawn(async move {
+            while let Ok(msg) = admin_rx.recv().await {
+                if ptx2.send(msg).is_err() { break }
+            }
+        });
+    }
 
     // Outbound pump: room broadcasts + this connection's private messages.
     let pump_room = room.clone();
@@ -131,7 +143,7 @@ async fn handle_socket(
                                 Err(_) => break, // Empty or Closed
                             }
                         }
-                        let snap = json!({ "type": "snapshot", "payload": pump_room.snapshot() }).to_string();
+                        let snap = json!({ "type": "snapshot", "payload": pump_room.inner.lock().unwrap().snapshot_for(&pump_room.id, is_admin) }).to_string();
                         if sink.send(WsMessage::Text(snap.into())).await.is_err() { break }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -232,6 +244,14 @@ fn handle_client(
                     ts: now,
                     reactions: BTreeMap::new(),
                 };
+                if room.cfg.moderated && !is_admin {
+                    inner.pending_messages.push(msg.clone());
+                    drop(inner);
+                    let ev = json!({ "type": "pending_message", "payload": msg });
+                    let _ = ptx.send(ev.to_string()); // submitter sees their own pending item
+                    room.broadcast_admin(ev);          // admins see it in their queue
+                    return;
+                }
                 inner.messages.push_back(msg.clone());
                 while inner.messages.len() > room.cfg.max_messages {
                     inner.messages.pop_front();
@@ -292,6 +312,14 @@ fn handle_client(
                 }
                 let id = inner.next_question_id();
                 let q = Question { id, text, votes: 0, pinned: false };
+                if room.cfg.moderated && !is_admin {
+                    inner.pending_questions.push(q.clone());
+                    drop(inner);
+                    let ev = json!({ "type": "pending_question", "payload": q });
+                    let _ = ptx.send(ev.to_string());
+                    room.broadcast_admin(ev);
+                    return;
+                }
                 inner.questions.push(q.clone());
                 json!({ "type": "question", "payload": q })
             };
@@ -359,6 +387,43 @@ fn handle_client(
         }
 
         // ── admin actions ───────────────────────────────────────────────
+        "admin_approve_message" => {
+            let Some(mid) = p.get("message_id").and_then(Value::as_u64) else { return };
+            let event = {
+                let mut inner = room.inner.lock().unwrap();
+                let Some(pos) = inner.pending_messages.iter().position(|m| m.id == mid) else { return };
+                let msg = inner.pending_messages.remove(pos);
+                inner.messages.push_back(msg.clone());
+                while inner.messages.len() > room.cfg.max_messages { inner.messages.pop_front(); }
+                json!({ "type": "message", "payload": msg })
+            };
+            room.broadcast(event);
+        }
+
+        "admin_reject_message" => {
+            let Some(mid) = p.get("message_id").and_then(Value::as_u64) else { return };
+            room.inner.lock().unwrap().pending_messages.retain(|m| m.id != mid);
+            room.broadcast(json!({ "type": "pending_message_rejected", "payload": { "id": mid } }));
+        }
+
+        "admin_approve_question" => {
+            let Some(qid) = p.get("question_id").and_then(Value::as_u64) else { return };
+            let event = {
+                let mut inner = room.inner.lock().unwrap();
+                let Some(pos) = inner.pending_questions.iter().position(|q| q.id == qid) else { return };
+                let q = inner.pending_questions.remove(pos);
+                inner.questions.push(q.clone());
+                json!({ "type": "question", "payload": q })
+            };
+            room.broadcast(event);
+        }
+
+        "admin_reject_question" => {
+            let Some(qid) = p.get("question_id").and_then(Value::as_u64) else { return };
+            room.inner.lock().unwrap().pending_questions.retain(|q| q.id != qid);
+            room.broadcast(json!({ "type": "pending_question_rejected", "payload": { "id": qid } }));
+        }
+
         "admin_lock" => {
             let locked = p.get("locked").and_then(Value::as_bool).unwrap_or(false);
             // Clamp the duration so the deadline math can't overflow and a
@@ -464,6 +529,15 @@ fn handle_client(
                     poll.closed = true;
                 }
                 Some(json!({ "type": "poll_closed", "payload": { "poll_id": pid } }))
+            });
+        }
+
+        "admin_delete_poll" => {
+            let Some(pid) = p.get("poll_id").and_then(Value::as_u64) else { return };
+            room.update(|inner| {
+                inner.polls.retain(|p| p.id != pid);
+                inner.poll_voters.remove(&pid);
+                Some(json!({ "type": "poll_deleted", "payload": { "poll_id": pid } }))
             });
         }
 
