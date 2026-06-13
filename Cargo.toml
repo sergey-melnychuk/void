@@ -4,3 +4,29 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+rust-embed = "8"
+mime_guess = "2"
+dashmap = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+bcrypt = "0.15"
+rand = "0.8"
+hex = "0.4"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio-tungstenite = "0.29"
+
+# Optimize the shippable binary for size (target: < 20MB, per VOID.md).
+[profile.release]
+opt-level = "z"   # optimize for size
+lto = true        # link-time optimization across crates
+codegen-units = 1 # better optimization at the cost of build parallelism
+strip = true      # strip symbols from the binary
+panic = "abort"   # drop unwinding machinery

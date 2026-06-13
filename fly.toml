@@ -1,0 +1,33 @@
+# Fly.io deployment. `fly deploy` builds the Dockerfile and ships the binary.
+# WebSockets work over the standard HTTP service — no special config needed.
+#
+# v1 is single-instance: all room state lives in process memory, so DO NOT scale
+# past one machine (no cross-instance state sharing). Keep `fly scale count 1`.
+# Set BASE_URL so the room links returned at creation point at your real host:
+#   fly secrets set BASE_URL=https://<your-app>.fly.dev
+
+app = "void"
+primary_region = "iad"
+
+[build]
+
+[env]
+  PORT = "8080"
+  # BASE_URL = "https://void.fly.dev"   # prefer `fly secrets set BASE_URL=...`
+
+[http_service]
+  internal_port = 8080
+  force_https = true            # HTTP → HTTPS; WebSocket upgrades to wss
+  # Keep the machine warm for a live talk; never auto-stop (in-memory state).
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    soft_limit = 200            # the per-room concurrency target from VOID.md
+    hard_limit = 250
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

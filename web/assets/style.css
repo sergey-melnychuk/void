@@ -1,0 +1,168 @@
+/* VOID — dark theme. Tokens per VOID.md UI/UX section. */
+:root {
+  --bg: #0a0a0a;
+  --bg-panel: #131316;
+  --bg-input: #1c1c21;
+  --border: #2a2a30;
+  --text: #ededed;
+  --text-dim: #8a8a93;
+  --accent: #7c3aed;
+  --accent-dim: #5b21b6;
+  --danger: #ef4444;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 15px;
+}
+
+#app { height: 100%; }
+
+/* ── Layout ─────────────────────────────────────────────── */
+.room {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-rows: auto auto 1fr;
+  height: 100%;
+}
+.room > header {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+.brand { font-family: var(--mono); font-weight: 700; letter-spacing: 0.15em; }
+.room-code {
+  font-family: var(--mono);
+  color: var(--accent);
+  background: var(--bg-input);
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+}
+.spacer { flex: 1; }
+.participants { color: var(--text-dim); font-family: var(--mono); }
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+.panel:last-child { border-right: none; }
+.panel > h2 {
+  margin: 0;
+  padding: 0.75rem 1rem;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+}
+.panel-body { flex: 1; overflow-y: auto; padding: 1rem; }
+.panel-footer { display: flex; gap: 0.5rem; align-items: center; padding: 0.75rem 1rem; border-top: 1px solid var(--border); }
+.panel-footer input { flex: 1; }
+.admin-btn { flex: 1; }
+
+/* ── Write-lock banner ──────────────────────────────────── */
+.banner-row { grid-column: 1 / -1; }
+.lock-banner {
+  background: var(--accent-dim);
+  color: #fff;
+  text-align: center;
+  padding: 0.4rem;
+  font-size: 0.85rem;
+}
+
+/* ── Messages ───────────────────────────────────────────── */
+.msg { margin-bottom: 0.75rem; animation: fade-in 0.18s ease-out; }
+.badge {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  padding: 0 0.3rem;
+  border-radius: 3px;
+  margin-right: 0.4rem;
+}
+.badge.admin { background: var(--accent); color: #fff; }
+.badge.user { background: var(--bg-input); color: var(--text-dim); }
+
+/* ── Forms ──────────────────────────────────────────────── */
+input, textarea, button, select {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem;
+}
+input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+button {
+  background: var(--accent);
+  border-color: var(--accent);
+  cursor: pointer;
+  font-weight: 600;
+}
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button.ghost { background: transparent; border-color: var(--border); }
+
+/* ── Centered forms (create / join) ─────────────────────── */
+.center {
+  height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+}
+.card {
+  width: min(420px, 100%);
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 2rem;
+}
+.card h1 { margin-top: 0; font-family: var(--mono); letter-spacing: 0.15em; }
+.field { display: flex; flex-direction: column; gap: 0.3rem; margin-bottom: 1rem; }
+.field label { font-size: 0.8rem; color: var(--text-dim); }
+
+/* ── Collapsible poll form ──────────────────────────────── */
+.poll-form-wrap { border-bottom: 1px solid var(--border); margin-bottom: 1rem; padding-bottom: 0.75rem; }
+.poll-form-toggle { width: 100%; display: flex; justify-content: space-between; }
+.poll-form-body { margin-top: 0.75rem; }
+
+@keyframes fade-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; } }
+
+/* ── Toast (transient server errors) ────────────────────── */
+.toast {
+  position: fixed;
+  bottom: 1.5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--danger);
+  color: #fff;
+  padding: 0.6rem 1rem;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  animation: fade-in 0.18s ease-out;
+  z-index: 10;
+}
+
+/* ── Mobile: single column with tab switcher ────────────── */
+@media (max-width: 800px) {
+  .room { grid-template-columns: 1fr; grid-template-rows: auto auto 1fr; }
+  .panel { border-right: none; border-bottom: 1px solid var(--border); }
+  .panel.hidden-mobile { display: none; }
+  .tabs { grid-column: 1 / -1; display: flex; border-bottom: 1px solid var(--border); }
+  .tabs button { flex: 1; background: transparent; border: none; border-radius: 0; color: var(--text-dim); }
+  .tabs button.active { color: var(--accent); border-bottom: 2px solid var(--accent); }
+}
+@media (min-width: 801px) { .tabs { display: none; } }
