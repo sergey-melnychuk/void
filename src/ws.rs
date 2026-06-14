@@ -97,7 +97,7 @@ async fn handle_socket(
             return; // socket dropped → connection closed
         }
         inner.participants += 1;
-        (inner.snapshot_for(&room.id, is_admin), inner.participants)
+        (inner.snapshot_for(&room.id, is_admin, room.title.as_deref()), inner.participants)
     };
 
     let (mut sink, mut stream) = socket.split();
@@ -143,7 +143,7 @@ async fn handle_socket(
                                 Err(_) => break, // Empty or Closed
                             }
                         }
-                        let snap = json!({ "type": "snapshot", "payload": pump_room.inner.lock().unwrap().snapshot_for(&pump_room.id, is_admin) }).to_string();
+                        let snap = json!({ "type": "snapshot", "payload": pump_room.inner.lock().unwrap().snapshot_for(&pump_room.id, is_admin, pump_room.title.as_deref()) }).to_string();
                         if sink.send(WsMessage::Text(snap.into())).await.is_err() { break }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -311,7 +311,7 @@ fn handle_client(
                     return personal_err(ptx, "locked", "room is locked");
                 }
                 let id = inner.next_question_id();
-                let q = Question { id, text, votes: 0, pinned: false };
+                let q = Question { id, text, votes: 0, pinned: false, answered: false };
                 if room.cfg.moderated && !is_admin {
                     inner.pending_questions.push(q.clone());
                     drop(inner);
@@ -333,15 +333,16 @@ fn handle_client(
                 if inner.effective_locked() && !is_admin {
                     return personal_err(ptx, "locked", "room is locked");
                 }
-                if !inner.questions.iter().any(|q| q.id == qid) {
-                    return;
+                match inner.questions.iter().find(|q| q.id == qid) {
+                    None => return,
+                    Some(q) if q.answered => return personal_err(ptx, "answered", "question already answered"),
+                    _ => {}
                 }
                 let voters = inner.question_voters.entry(qid).or_default();
-                if !voters.insert(identity.to_string()) {
-                    return personal_err(ptx, "already_voted", "you already voted");
-                }
+                let already = !voters.insert(identity.to_string());
+                if already { voters.remove(identity); }
                 let q = inner.questions.iter_mut().find(|q| q.id == qid).unwrap();
-                q.votes += 1;
+                if already { q.votes = q.votes.saturating_sub(1); } else { q.votes += 1; }
                 json!({ "type": "vote", "payload": { "question_id": qid, "votes": q.votes } })
             };
             room.broadcast(event);
@@ -484,6 +485,17 @@ fn handle_client(
             });
         }
 
+        "admin_answer_question" => {
+            let Some(qid) = p.get("question_id").and_then(Value::as_u64) else { return };
+            room.update(|inner| {
+                if let Some(q) = inner.questions.iter_mut().find(|q| q.id == qid) {
+                    q.answered = true;
+                    q.pinned = false;
+                }
+                Some(json!({ "type": "question_answered", "payload": { "question_id": qid } }))
+            });
+        }
+
         "admin_dismiss_question" => {
             let Some(qid) = p.get("question_id").and_then(Value::as_u64) else { return };
             room.update(|inner| {
@@ -539,6 +551,12 @@ fn handle_client(
                 inner.poll_voters.remove(&pid);
                 Some(json!({ "type": "poll_deleted", "payload": { "poll_id": pid } }))
             });
+        }
+
+        "admin_display_mode" => {
+            let mode = p.get("mode").and_then(Value::as_str).unwrap_or("questions");
+            if !["questions", "messages", "polls", "qr"].contains(&mode) { return }
+            room.broadcast(json!({ "type": "display_mode", "payload": { "mode": mode } }));
         }
 
         "admin_close_room" => {

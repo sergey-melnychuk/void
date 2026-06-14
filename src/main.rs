@@ -21,9 +21,10 @@ async fn main() {
 
     // Permanent test room: id "test", no password, admin secret "itworks".
     // TTL u64::MAX saturates expires_at to u64::MAX so it is never reaped.
-    state.rooms.insert("abcdef".into(), Room::new(
-        "abcdef".into(),
-        "cafebabe".into(),
+    state.rooms.insert("test".into(), Room::new(
+        "test".into(),
+        None,
+        "test".into(),
         None,
         u64::MAX,
         RoomConfig {

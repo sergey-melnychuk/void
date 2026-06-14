@@ -26,6 +26,7 @@ use crate::state::{AppState, Room, RoomConfig};
 #[derive(Deserialize, Default)]
 pub struct CreateRoomReq {
     pub ttl_seconds: Option<u64>,
+    pub title: Option<String>,
     pub password: Option<String>,
     pub max_participants: Option<usize>,
     pub max_messages: Option<usize>,
@@ -69,8 +70,9 @@ pub async fn create_room(
         return (StatusCode::INTERNAL_SERVER_ERROR, "could not allocate room id").into_response();
     }
 
+    let title = req.title.map(|t| t.trim().chars().take(20).collect::<String>()).filter(|t| !t.is_empty());
     let secret = auth::new_secret();
-    let room = Room::new(room_id.clone(), secret.clone(), password_hash, ttl, room_cfg);
+    let room = Room::new(room_id.clone(), title, secret.clone(), password_hash, ttl, room_cfg);
     app.rooms.insert(room_id.clone(), room);
 
     let base = cfg.base_url.trim_end_matches('/');
@@ -137,7 +139,7 @@ pub async fn join_room(
             _ => auth::new_session_token(),
         };
         inner.sessions.insert(token.clone());
-        (token, inner.snapshot(&room.id))
+        (token, inner.snapshot(&room.id, room.title.as_deref()))
     };
 
     Json(json!({ "session_token": token, "state": snapshot })).into_response()

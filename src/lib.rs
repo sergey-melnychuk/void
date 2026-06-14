@@ -34,6 +34,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/", get(index))
         .route("/r/{room_id}", get(index))
         .route("/r/{room_id}/{secret}", get(index))
+        .route("/w/{room_id}", get(index))
         // REST.
         .route("/rooms", post(handlers::create_room))
         .route("/r/{room_id}/join", post(handlers::join_room))

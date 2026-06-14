@@ -51,6 +51,7 @@ pub struct Question {
     pub text: String,
     pub votes: u32,
     pub pinned: bool,
+    pub answered: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -78,6 +79,7 @@ pub struct RoomConfig {
 
 pub struct Room {
     pub id: String,
+    pub title: Option<String>,
     /// Admin secret — kept so the admin token can be recomputed and compared.
     pub secret: String,
     pub password_hash: Option<String>,
@@ -128,6 +130,7 @@ pub struct RoomInner {
 impl Room {
     pub fn new(
         id: String,
+        title: Option<String>,
         secret: String,
         password_hash: Option<String>,
         ttl_seconds: u64,
@@ -139,6 +142,7 @@ impl Room {
         let (admin_tx, _arx) = broadcast::channel(256);
         Arc::new(Room {
             id,
+            title,
             secret,
             password_hash,
             expires_at: now_ms().saturating_add(ttl_seconds.saturating_mul(1000)),
@@ -189,7 +193,7 @@ impl Room {
 
     /// Build the admin state snapshot (returned by `GET /r/:id/state`).
     pub fn snapshot(&self) -> Value {
-        self.inner.lock().unwrap().snapshot_for(&self.id, true)
+        self.inner.lock().unwrap().snapshot_for(&self.id, true, self.title.as_deref())
     }
 }
 
@@ -200,14 +204,15 @@ impl RoomInner {
         self.locked && self.locked_until.map_or(true, |until| now_ms() < until)
     }
 
-    pub fn snapshot(&self, room_id: &str) -> Value {
-        self.snapshot_for(room_id, false)
+    pub fn snapshot(&self, room_id: &str, title: Option<&str>) -> Value {
+        self.snapshot_for(room_id, false, title)
     }
 
-    pub fn snapshot_for(&self, room_id: &str, is_admin: bool) -> Value {
+    pub fn snapshot_for(&self, room_id: &str, is_admin: bool, title: Option<&str>) -> Value {
         let locked = self.effective_locked();
         let mut v = json!({
             "id": room_id,
+            "title": title,
             "locked": locked,
             "locked_until": if locked { self.locked_until } else { None },
             "participants": self.participants,
