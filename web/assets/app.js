@@ -289,7 +289,7 @@ const App = {
       const res = await fetch(`/r/${roomId}/join`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ session, password: null }),
+        body: JSON.stringify({ session, password: null, display: true }),
       })
       if (!res.ok) { ui.error = 'Room not found or expired'; ui.view = 'error'; return }
       const data = await res.json()
@@ -329,13 +329,14 @@ const App = {
       lastMessageDraft = text
       if (send('message', { text })) draft.message = ''
     }
-    function react(messageId, emoji) { send('reaction', { message_id: messageId, emoji }) }
+    function react(messageId, emoji) { if (!ui.isDisplay) send('reaction', { message_id: messageId, emoji }) }
     function submitQuestion() {
       const text = draft.question.trim()
       if (!text) return
       if (send('question', { text })) draft.question = ''
     }
     function voteQuestion(id) {
+      if (ui.isDisplay) return
       if (!send('vote', { question_id: id })) return
       if (myVotes.has(id)) myVotes.delete(id); else myVotes.add(id)
     }
@@ -503,7 +504,7 @@ const App = {
 
     <!-- Messages -->
     <section class="panel" :class="{'hidden-mobile': ui.tab!=='chat'}">
-      <h2>Messages</h2>
+      <h2>Messages <span v-if="room.messages.length" class="panel-count">{{ room.messages.length }}</span></h2>
       <div class="panel-body">
         <div v-if="ui.isAdmin && !ui.isDisplay && room.pendingMessages.length" class="pending-queue">
           <div class="pending-label">Pending approval</div>
@@ -519,10 +520,11 @@ const App = {
           <span class="badge" :class="m.role">[{{ m.role }}]</span>{{ m.text }}
           <button v-if="ui.isAdmin && !ui.isDisplay" class="ghost" style="padding:0 .3rem;font-size:.7rem" @click="deleteMessage(m.id)">✕</button>
           <div style="margin-top:.2rem;display:flex;flex-wrap:wrap;gap:.25rem;align-items:center">
-            <button v-for="e in REACTIONS.filter(e => m.reactions[e])" :key="e" class="ghost reaction" @click="react(m.id, e)">
+            <button v-for="e in REACTIONS.filter(e => m.reactions[e])" :key="e" class="ghost reaction"
+              :disabled="ui.isDisplay" @click="react(m.id, e)">
               {{ e }} {{ m.reactions[e] }}
             </button>
-            <div class="reaction-picker" style="position:relative;display:inline-block">
+            <div v-if="!ui.isDisplay" class="reaction-picker" style="position:relative;display:inline-block">
               <button class="ghost reaction add-reaction" @click="m._pick=!m._pick">+</button>
               <div v-if="m._pick" class="reaction-menu">
                 <button v-for="e in REACTIONS" :key="e" class="ghost reaction" @click="react(m.id, e);m._pick=false">{{ e }}</button>
@@ -546,7 +548,7 @@ const App = {
 
     <!-- Questions -->
     <section class="panel" :class="{'hidden-mobile': ui.tab!=='qa'}">
-      <h2>Questions</h2>
+      <h2>Questions <span v-if="room.questions.length" class="panel-count">{{ room.questions.length }}</span></h2>
       <div class="panel-body">
         <div v-if="ui.isAdmin && !ui.isDisplay && room.pendingQuestions.length" class="pending-queue">
           <div class="pending-label">Pending approval</div>
@@ -559,7 +561,8 @@ const App = {
           </div>
         </div>
         <div v-for="q in sortedQuestions" :key="q.id" class="msg" :class="{'question-answered': q.answered}">
-          <button class="ghost" :class="{'voted-btn': myVotes.has(q.id)}" style="padding:0 .4rem" :disabled="q.answered || (room.locked && !ui.isAdmin)" @click="voteQuestion(q.id)">▲ {{ q.votes }}</button>
+          <button v-if="!ui.isDisplay" class="ghost" :class="{'voted-btn': myVotes.has(q.id)}" style="padding:0 .4rem" :disabled="q.answered || (room.locked && !ui.isAdmin)" @click="voteQuestion(q.id)">▲ {{ q.votes }}</button>
+          <span v-else style="color:var(--text-dim);font-size:.85rem;padding:0 .3rem">▲ {{ q.votes }}</span>
           <span v-if="q.pinned" style="color:var(--accent)">📌 </span>{{ q.text }}
           <template v-if="ui.isAdmin && !ui.isDisplay">
             <button v-if="!q.answered" class="ghost" style="padding:0 .3rem;font-size:.7rem" @click="answerQuestion(q.id)">✓</button>
@@ -583,7 +586,7 @@ const App = {
 
     <!-- Polls -->
     <section class="panel" :class="{'hidden-mobile': ui.tab!=='polls'}">
-      <h2>Polls</h2>
+      <h2>Polls <span v-if="room.polls.length" class="panel-count">{{ room.polls.length }}</span></h2>
       <div class="panel-body">
         <div v-for="p in [...room.polls].reverse()" :key="p.id" class="msg">
           <strong>{{ p.question }}</strong>

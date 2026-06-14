@@ -57,6 +57,7 @@ pub async fn ws_handler(
     // Each admin connection gets a distinct identity, so two admin browsers
     // (a supported scenario) vote/react/rate-limit independently. Privileges
     // are gated on `is_admin`, not on the identity string.
+    let is_display = !is_admin && token.starts_with("disp.");
     let identity = if is_admin {
         format!("admin:{}", auth::new_session_token())
     } else {
@@ -68,7 +69,7 @@ pub async fn ws_handler(
         Some((proto, _)) => ws.protocols([proto]),
         None => ws,
     };
-    ws.on_upgrade(move |socket| handle_socket(socket, app, room, identity, is_admin))
+    ws.on_upgrade(move |socket| handle_socket(socket, app, room, identity, is_admin, is_display))
 }
 
 /// Extract `(full_protocol, token)` from the `Sec-WebSocket-Protocol` header.
@@ -85,18 +86,22 @@ async fn handle_socket(
     room: Arc<Room>,
     identity: String,
     is_admin: bool,
+    is_display: bool,
 ) {
     // Subscribe BEFORE snapshotting so no event broadcast in the gap is lost;
     // any overlap is deduped by id on the client.
     let mut rx = room.tx.subscribe();
 
     // Enter: participant cap check + increment + snapshot, all under one lock.
+    // Display connections are invisible — they don't count toward the cap or the counter.
     let (snapshot, count) = {
         let mut inner = room.inner.lock().unwrap();
-        if inner.participants >= room.cfg.max_participants {
-            return; // socket dropped → connection closed
+        if !is_display {
+            if inner.participants >= room.cfg.max_participants {
+                return; // socket dropped → connection closed
+            }
+            inner.participants += 1;
         }
-        inner.participants += 1;
         (inner.snapshot_for(&room.id, is_admin, room.title.as_deref()), inner.participants)
     };
 
@@ -106,10 +111,10 @@ async fn handle_socket(
     // starts — so no live event can ever be delivered ahead of it.
     let first = json!({ "type": "snapshot", "payload": snapshot }).to_string();
     if sink.send(WsMessage::Text(first.into())).await.is_err() {
-        leave(&room);
+        if !is_display { leave(&room); }
         return;
     }
-    broadcast_participants(&room, count);
+    if !is_display { broadcast_participants(&room, count); }
 
     let (ptx, mut prx) = mpsc::unbounded_channel::<String>();
 
@@ -158,14 +163,14 @@ async fn handle_socket(
     // Inbound loop.
     while let Some(Ok(msg)) = stream.next().await {
         match msg {
-            WsMessage::Text(t) => handle_client(&app, &room, &identity, is_admin, t.as_str(), &ptx),
+            WsMessage::Text(t) => handle_client(&app, &room, &identity, is_admin, is_display, t.as_str(), &ptx),
             WsMessage::Close(_) => break,
             _ => {}
         }
     }
 
     send_task.abort();
-    leave(&room);
+    if !is_display { leave(&room); }
 }
 
 /// Decrement the participant count and announce the new total.
@@ -198,6 +203,7 @@ fn handle_client(
     room: &Arc<Room>,
     identity: &str,
     is_admin: bool,
+    is_display: bool,
     text: &str,
     ptx: &mpsc::UnboundedSender<String>,
 ) {
@@ -206,6 +212,9 @@ fn handle_client(
     };
     let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
     let p = v.get("payload").cloned().unwrap_or_else(|| json!({}));
+
+    // Display connections are read-only — silently drop all input.
+    if is_display { return; }
 
     // Admin-only actions gate up front.
     if kind.starts_with("admin_") && !is_admin {

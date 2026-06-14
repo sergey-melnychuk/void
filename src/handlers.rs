@@ -91,6 +91,8 @@ pub struct JoinReq {
     pub password: Option<String>,
     /// An existing session token (from localStorage) for reconnect.
     pub session: Option<String>,
+    /// Set by the display window — mints a display-scoped identity.
+    pub display: Option<bool>,
 }
 
 pub async fn join_room(
@@ -136,6 +138,7 @@ pub async fn join_room(
         let mut inner = room.inner.lock().unwrap();
         let token = match (reconnecting, &req.session) {
             (true, Some(t)) => t.clone(),
+            _ if req.display == Some(true) => format!("disp.{}", auth::new_session_token()),
             _ => auth::new_session_token(),
         };
         inner.sessions.insert(token.clone());
