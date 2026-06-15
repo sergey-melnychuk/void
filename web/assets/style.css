@@ -88,7 +88,7 @@ html, body {
 }
 
 /* ── Messages ───────────────────────────────────────────── */
-.msg { margin-bottom: 0.75rem; animation: fade-in 0.18s ease-out; }
+.msg { margin-bottom: 0.75rem; animation: fade-in 0.18s ease-out; white-space: pre-wrap; }
 .badge {
   font-family: var(--mono);
   font-size: 0.7rem;
@@ -145,7 +145,7 @@ button.ghost { background: transparent; border-color: var(--border); }
 /* ── User's own pending items (moderated room) ──────────── */
 .my-pending-wrap { border-top: 1px solid var(--border); padding: .5rem 1rem; }
 .my-pending-item { font-size: .9rem; padding: .3rem .5rem; border-radius: 4px; margin-bottom: .3rem;
-  display: flex; justify-content: space-between; align-items: baseline; gap: .5rem; }
+  display: flex; justify-content: space-between; align-items: baseline; gap: .5rem; white-space: pre-wrap; }
 .my-pending-item.pending { opacity: .5; font-style: italic; }
 .my-pending-item.rejected { background: rgba(239,68,68,.15); color: var(--danger); }
 .my-pending-status { font-size: .7rem; white-space: nowrap; color: inherit; }

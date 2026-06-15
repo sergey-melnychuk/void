@@ -2,96 +2,42 @@
 
 ## Overview
 
-VOID is a lightweight, ephemeral chat room service designed for conference talks, workshops, and live sessions. A presenter creates a room, shares a short link, and the room disappears when the session ends. No accounts, no persistence, no noise.
+VOID is a lightweight, ephemeral chat room service for conference talks, workshops, and live
+sessions. A presenter creates a room, shares a short link, and the room disappears when the
+session ends. No accounts, no noise.
+
+Single Rust binary: `web/` assets embedded via `rust-embed`, room state in process memory
+with optional Postgres persistence, background TTL sweep. Zero runtime dependencies to deploy.
 
 ---
 
-## Features
+## Current Implementation Status
 
-### Room Lifecycle
+### Implemented and working in production
 
-- **Create room** — single POST request, no account required
-- **Optional password** — attendees must enter password to join; protects against randos with the link
-- **TTL** — configurable at room creation (default: 2 hours, max: 24 hours); all state wiped on expiry
-- **Manual close** — admin can close the room early
-- **Write lock** — admin can freeze chat (temporarily or permanently); attendees see a "room is locked" indicator; useful during talk, unlocked for Q&A
+- Room creation with configurable TTL, password, participant cap, message cap, rate limit, moderated mode
+- WebSocket fan-out via `tokio::sync::broadcast` (per-room channel)
+- Admin token derived client-side (HMAC-SHA256), validated server-side on every privileged action
+- Chat: messages, reactions (👍 ❤️ 😂 🔥 🤔), per-user rate limiting, write lock (timed or permanent)
+- Q&A board: questions, upvoting (toggle), pin, answer, dismiss
+- Polls: create, live vote counts, close, delete
+- Moderated mode: pending queue for messages and questions; admin approve/reject; queue persisted across restarts
+- Display window (`/w/<id>`): read-only projection view with live QR code widget
+- Room state survives server restarts (Postgres event sourcing, startup replay)
+- IP-based room creation rate limiting
+- Room sweep: in-memory reap + DB delete on TTL expiry
 
-### Links
+### Planned / not yet built
 
-- **Public link** — `void.sh/r/<room_id>` e.g. `void.sh/r/a3f9c2`; share on a slide; no auth required to join
-- **Private link** — `void.sh/r/<room_id>/<secret>` e.g. `void.sh/r/a3f9c2/8f3kQpXmN2vLzR9w`; shown once at room creation; whoever holds it has admin privileges
-
-### Users
-
-- **Two roles only** — `admin` (holds admin token) and `user` (everyone else); no usernames, no per-user identity
-- **No registration** — session token is ephemeral, scoped to the room, stored in a cookie for reconnect within TTL
-- **Messages are anonymous** — chat shows only role badge: `[admin]` or `[user]`
-
-### Chat
-
-- **Real-time messaging** via WebSocket
-- **Per-user rate limit** — configurable by admin at room creation (default: 1 message / 3 seconds)
-- **Global write lock** — admin toggle; can be timed (e.g. locked for 5 minutes) or indefinite
-- **Message moderation** — admin can delete individual messages
-- **Reactions** — emoji reactions on messages (👍 ❤️ 😂 🔥 🤔); counts shown inline
-- **Max message length** — 500 characters
-
-### Q&A
-
-- **Submit question** — any attendee can post a question to the Q&A board (separate from chat)
-- **Upvoting** — one vote per user per question; sorted by vote count descending
-- **Admin pins** — admin can pin a question to the top (currently being answered)
-- **Admin dismiss** — admin can remove a question from the board
-
-### Polls
-
-- **Create poll** — admin only; multiple choice, 2–6 options
-- **Live results** — results update in real-time as votes come in; displayed as bar chart (CSS only, no lib)
-- **One vote per user** — enforced server-side per session token
-- **Close poll** — admin closes voting; results frozen and displayed
-- **Multiple polls** — admin can run polls sequentially; previous results remain visible
-
-### Admin Controls (summary)
-
-- Write lock (toggle / timed)
-- Close room
-- Delete messages
-- Pin / dismiss Q&A questions
-- Create / close polls
-- View participant count
-
----
-
-## Requirements
-
-### Functional
-
-- Room state (messages, Q&A, polls, participants) lives entirely in process memory; no external storage in v1
-- Messages per room capped at N, configurable at room creation (default: 200, max: 1000); implemented as `VecDeque<Message>` — push back, pop front when full
-- TTL enforced by a background `tokio::task` sweeping expired rooms periodically; no orphaned rooms
-- Admin token validated server-side on every privileged WebSocket message; never stored, recomputed from private room segment
-- Rate limiting enforced server-side per session token, not per IP
-- Room ID: 3 bytes as hex, 6 lowercase hex chars (e.g. `a3f9c2`); 16M possible rooms
-- Max participants per room: configurable at room creation; enforced at join
-
-### Non-Functional
-
-- Cold join (WebSocket connect + full room state snapshot) < 200ms
-- Support 200 concurrent users per room without degradation
-- No database, no Redis, no external dependencies in v1; single binary deployment
-- Binary size target: < 20MB
-- Svelte 5 + Vite build step; compiled output bundled into binary via `rust-embed`; no framework runtime shipped to browser
-
-### Security
-
-- **Public link** — 6-char hex room ID, e.g. `void.sh/r/a3f9c2`; safe to share on a slide
-- **Private link** — room ID + 16-byte random secret, e.g. `void.sh/r/a3f9c2/8f3kQpXmN2vLzR9w`; whoever holds it is admin; shown once at room creation
-- **Admin token** — derived client-side: `HMAC-SHA256(key=secret, msg=room_id)`; server recomputes and compares on every privileged action; never stored
-- **Constant-time comparison** on admin token validation — no timing attacks
-- Room password: bcrypt-hashed in memory
-- No PII collected or stored
-- HTTPS enforced in production; HTTP redirects to HTTPS
-- CORS locked to own origin
+- **Topics** — `topics: Vec<String>` on Room; admin sets topics at creation or live; each
+  message/question tagged with a topic; free users filter to one topic, paid users subscribe
+  to multiple
+- **Paid tier** — custom URL slugs (verified by email domain + manual approval, $50/day),
+  30-day TTL, unlimited caps, recap export (JSON/PDF) on expiry ($20/day/room)
+- **Email ownership** — paid admin can reset admin secret via email; prevents permanent lockout
+- **Payment integration** — Stripe + crypto; day = 3h free trial + 24h paid, starts at payment second
+- **Monitoring/alerting** — health endpoint, structured logs, error aggregation (future)
+- **Multi-instance** — sticky sessions by room_id, Postgres NOTIFY or Redis for cross-instance broadcast
 
 ---
 
@@ -99,290 +45,341 @@ VOID is a lightweight, ephemeral chat room service designed for conference talks
 
 | Layer | Choice | Notes |
 |---|---|---|
-| Backend | Rust / Axum | Async, pure JSON API + WebSocket, no HTML rendering |
-| State | In-process `DashMap` | Room state in memory; `VecDeque` per room for capped message history |
-| Broadcast | `tokio::sync::broadcast` | Per-room channel; no external pub/sub needed |
-| Frontend | Svelte 5 + Vite | Compiled to vanilla JS, no runtime, minimal bundle |
-| Styling | Vanilla CSS, custom properties | Dark theme, responsive, no framework |
-| Static assets | `rust-embed` | HTML/JS/CSS compiled into binary, zero runtime deps |
-| Config | ENV vars | 12-factor, no config files in repo |
+| Backend | Rust / Axum | Async, single binary |
+| State | In-process `DashMap<String, Arc<Room>>` | `VecDeque<Message>` per room for capped history |
+| Broadcast | `tokio::sync::broadcast` per room | + `admin_tx` for pending-item notifications |
+| Frontend | Vue 3 via CDN, no build step | Single `web/assets/app.js`; resolved via import map in `index.html` |
+| Styling | Vanilla CSS, custom properties | Dark theme, responsive; `web/assets/style.css` |
+| Static assets | `rust-embed` (`web/` folder) | Binary embeds all HTML/JS/CSS; no files to deploy |
+| Persistence | Postgres via SQLx 0.9 | Optional; fire-and-forget writes; startup event replay |
+| Config | ENV vars | All have defaults; zero-config local run |
+| License | BSL 1.1 | Free for non-commercial self-hosting <20 participants; converts to MIT 2030-01-01 |
 
-### Frontend Architecture
+### File layout
 
-Svelte 5 + Vite. Build output (`dist/`) is embedded into the Rust binary via `rust-embed` and served as static assets. No framework runtime shipped to the browser — Svelte compiles to vanilla JS.
-
-**Build:**
 ```
-frontend/
-  src/
-    App.svelte
-    components/
-      RoomCreate.svelte
-      RoomJoin.svelte
-      ChatPanel.svelte
-      QABoard.svelte
-      PollPanel.svelte
-      AdminBar.svelte
-      Reactions.svelte
-    lib/
-      store.js       # shared reactive state (Svelte stores)
-      socket.js      # WebSocket lifecycle + event dispatch
-  index.html
-  vite.config.js
-```
-
-`cargo build` runs `vite build` as a `build.rs` step; output embedded via `rust-embed`.
-
-**Component breakdown:**
-
-| Component | Responsibility |
-|---|---|
-| `App` | Root; WebSocket lifecycle, global room state, routing (create / join / room) |
-| `RoomCreate` | Room creation form: TTL, optional password, max participants, message history cap, rate limit |
-| `RoomJoin` | Password entry, join confirmation |
-| `ChatPanel` | Message list, input, write lock state |
-| `QABoard` | Question list sorted by votes, submit form |
-| `PollPanel` | Active poll display, voting, results bar |
-| `AdminBar` | Write lock toggle, close room, participant count |
-| `Reactions` | Emoji reaction strip per message |
-
-**Reactive store (`src/lib/store.js`):**
-
-```js
-import { writable, derived } from 'svelte/store'
-
-export const room = writable({
-  id: null,
-  locked: false,
-  participants: 0,
-  messages: [],
-  questions: [],
-  polls: [],
-})
+src/
+  main.rs        — startup: config, DB connect+migrate, replay, test room, sweep, serve
+  lib.rs         — router definition, rust-embed mount
+  config.rs      — Config struct, ENV var parsing, clamp helpers
+  state.rs       — AppState, Room, RoomInner, RoomConfig, apply_event (replay logic)
+  handlers.rs    — POST /rooms, POST /r/:id/join, GET /r/:id/state, sweep_expired task
+  ws.rs          — WebSocket handler, handle_client (full protocol), persist() helper
+  auth.rs        — bcrypt hash/verify, admin token (HMAC-SHA256), room ID / secret / session token generation
+  db.rs          — connect, run_migrations, persist_room, append_event, delete_room, delete_expired, replay_all
+web/
+  index.html     — SPA shell with Vue 3 import map
+  assets/
+    app.js       — all frontend logic and template (Vue 3 Composition API, single file)
+    style.css    — dark theme, responsive layout
+db/
+  0001_initial.sql  — migration: rooms + events tables, indexes
 ```
 
-**WebSocket event routing (`src/lib/socket.js`):**
+---
 
-```js
-ws.onmessage = ({ data }) => {
-  const event = JSON.parse(data)
-  room.update(r => {
-    switch (event.type) {
-      case 'message':            r.messages.push(event.payload); break
-      case 'message_deleted':    r.messages = r.messages.filter(m => m.id !== event.payload.id); break
-      case 'reaction':           /* update message reactions by id */ break
-      case 'question':           r.questions.push(event.payload); break
-      case 'vote':               /* update question vote count by id */ break
-      case 'question_pinned':    /* set pinned flag by id */ break
-      case 'question_dismissed': r.questions = r.questions.filter(q => q.id !== event.payload.question_id); break
-      case 'poll_created':       r.polls.push(event.payload); break
-      case 'poll_update':        /* update vote counts by id */ break
-      case 'poll_closed':        /* set closed flag by id */ break
-      case 'lock':               r.locked = event.payload.locked; break
-      case 'room_closed':        window.location.href = '/'; break
-      case 'participant_count':  r.participants = event.payload.count; break
-    }
-    return r
-  })
-}
-```
+## Configuration (ENV vars)
 
-**Alternative:** Vue 3 via CDN (`https://esm.sh/vue@3`) with Composition API is a viable drop-in alternative requiring no build step — trade slightly larger runtime (~33KB) for zero tooling. Recommended only if eliminating the build step is a hard requirement.
+All have built-in defaults; binary starts with zero config.
 
-### UI/UX
-
-- **Dark theme** — near-black background (`#0a0a0a`), off-white text, accent color: deep violet (`#7c3aed`) or void-appropriate cold blue
-- **Layout** — three-column desktop (chat | Q&A | polls+admin), single-column mobile with tab switcher
-- **Typography** — monospace for room codes and role badges; sans-serif for messages
-- **Animations** — subtle fade-in for new messages and questions; no layout shifts
-- **Write lock indicator** — full-width banner, hard to miss
+| Variable | Default | Notes |
+|---|---|---|
+| `HOST` | `0.0.0.0` | Bind address |
+| `PORT` | `8080` | Bind port |
+| `BASE_URL` | `http://localhost:8080` | Prefix for generated room URLs |
+| `DATABASE_URL` | _(unset)_ | Postgres URL; omit for pure in-memory mode |
+| `BCRYPT_COST` | `10` | bcrypt work factor for room passwords |
+| `DEFAULT_TTL_SECONDS` | `7200` | Room TTL when not specified (2 h) |
+| `MAX_TTL_SECONDS` | `86400` | Hard cap (24 h) |
+| `DEFAULT_MAX_MESSAGES` | `200` | Messages kept per room |
+| `MAX_MESSAGES_PER_ROOM` | `1000` | Hard cap |
+| `DEFAULT_MAX_PARTICIPANTS` | `100` | Concurrent WS connections per room |
+| `MAX_PARTICIPANTS_PER_ROOM` | `500` | Hard cap |
+| `DEFAULT_RATE_LIMIT_SECONDS` | `3` | Min gap between messages per session |
+| `MAX_MESSAGE_LENGTH` | `500` | Characters per message (also enforced on questions) |
+| `TTL_SWEEP_INTERVAL_SECONDS` | `60` | Background reap frequency |
+| `ROOM_CREATION_LIMIT` | `10` | Max rooms per IP per window |
+| `ROOM_CREATION_WINDOW_SECONDS` | `3600` | Sliding window for creation rate limit |
 
 ---
 
 ## API Surface
 
-All room interactions after join go through WebSocket. REST endpoints are minimal:
+### REST
 
 ```
-POST   /rooms                  Create room → { room_id, public_url, admin_url }
-GET    /r/:room_id             Serve SPA (index.html from rust-embed)
-GET    /r/:room_id/state       Initial room state snapshot (messages, questions, active poll, lock status)
-WS     /r/:room_id/ws          WebSocket connection; query param: ?token=<session|admin>
-GET    /assets/*               Static JS/CSS served from rust-embed
+POST  /rooms              Create room → { room_id, public_url, admin_url }
+POST  /r/:id/join         Join room → { session_token, state }
+GET   /r/:id/state        Admin-only state snapshot (Authorization: Bearer <admin_token>)
+GET   /r/:id              Serve SPA shell (index.html)
+GET   /r/:id/:secret      Serve SPA shell (frontend reads secret from URL, derives admin token)
+GET   /w/:id              Serve SPA shell (display window path)
+WS    /r/:id/ws           WebSocket connection
+GET   /assets/*           Embedded static assets
 ```
 
-Room creation returns the private (admin) URL once — it is never retrievable again. The admin bookmarks it.
+**Room creation** (`POST /rooms`) body (all optional):
+
+```json
+{
+  "ttl_seconds": 7200,
+  "title": "RustConf 2026",
+  "password": "secret",
+  "max_participants": 100,
+  "max_messages": 200,
+  "rate_limit_seconds": 3,
+  "moderated": false
+}
+```
+
+Response:
+
+```json
+{
+  "room_id": "a3f9c2",
+  "public_url": "https://0xff.wtf/r/a3f9c2",
+  "admin_url": "https://0xff.wtf/r/a3f9c2/8f3kQpXmN2vLzR9w"
+}
+```
+
+The admin URL is returned once and never retrievable again.
+
+**Join** (`POST /r/:id/join`) body:
+
+```json
+{ "session": "<existing_token_or_null>", "password": "optional", "display": false }
+```
+
+Response includes `session_token` (stored in `localStorage`) and `state` (same shape as snapshot payload).
+
+### Auth model
+
+- **Admin token**: derived client-side — `HMAC-SHA256(key=secret, msg=room_id)` as lowercase hex.
+  Secret comes from the URL segment (`/r/:id/:secret`). Server recomputes and compares with `ct_eq`
+  on every privileged WS action. Token is never stored anywhere.
+- **Session token**: server-minted 16-byte random hex on join. Stored in `localStorage`, sent via
+  `Sec-WebSocket-Protocol: void.token.<token>` on WS connect. Admitted to room's `sessions` set;
+  persists in-memory (not in DB) — resets on server restart, requiring re-join.
+- **Display token**: prefixed `disp.<random>`, admitted but invisible (no participant count,
+  read-only, no cap enforcement).
 
 ---
 
 ## WebSocket Protocol
 
-All messages are JSON. Server broadcasts events to all room subscribers via `tokio::sync::broadcast`; Svelte store updates trigger reactive re-renders.
+Token travels in the `Sec-WebSocket-Protocol` header (never in the URL — stays out of access logs).
 
-### Server → Client Events
+### Server → Client
 
-| `type` | Payload | Description |
+| `type` | Key payload fields | Notes |
 |---|---|---|
-| `message` | `{ id, role: "admin"|"user", text, ts, reactions }` | New chat message |
-| `message_deleted` | `{ id }` | Message removed by admin |
-| `reaction` | `{ message_id, emoji, count }` | Reaction count updated |
-| `question` | `{ id, text, votes, pinned }` | New Q&A question |
-| `vote` | `{ question_id, votes }` | Question vote count updated |
-| `question_pinned` | `{ question_id }` | Question pinned by admin |
-| `question_dismissed` | `{ question_id }` | Question removed by admin |
-| `poll_created` | `{ id, question, options }` | New poll opened |
-| `poll_update` | `{ poll_id, options: [{ text, votes }] }` | Live vote counts |
-| `poll_closed` | `{ poll_id }` | Poll closed, results final |
-| `lock` | `{ locked: bool, until?: epoch_ms }` | Write lock state change |
-| `room_closed` | `{}` | Room shut down by admin |
-| `participant_count` | `{ count }` | Participant count update |
-| `error` | `{ code, message }` | Rate limit, auth failure, etc. |
+| `snapshot` | full room state object | First frame on connect; also sent on lag-resync |
+| `message` | `{ id, role, text, ts, reactions }` | New or approved chat message |
+| `message_deleted` | `{ id }` | |
+| `reaction` | `{ message_id, emoji, count }` | count=0 means removed |
+| `question` | `{ id, text, votes, pinned, answered }` | New or approved question |
+| `vote` | `{ question_id, votes }` | |
+| `question_pinned` | `{ question_id, pinned }` | pinned=false unpins |
+| `question_answered` | `{ question_id }` | Marks answered, unpins |
+| `question_dismissed` | `{ question_id }` | |
+| `poll_created` | `{ id, question, options: [{text,votes}], closed }` | |
+| `poll_update` | `{ poll_id, options: [{text,votes}] }` | After each vote |
+| `poll_closed` | `{ poll_id }` | |
+| `poll_deleted` | `{ poll_id }` | |
+| `pending_message` | `{ id, role, text, ts, reactions }` | Sent to submitter (personal) + admin channel |
+| `pending_message_rejected` | `{ id }` | Broadcast to all (submitter shows "dropped") |
+| `pending_question` | `{ id, text, votes, pinned, answered }` | Same routing as pending_message |
+| `pending_question_rejected` | `{ id }` | |
+| `lock` | `{ locked, until? }` | `until` = epoch ms for timed lock |
+| `room_closed` | `{}` | Room closed by admin or TTL sweep |
+| `participant_count` | `{ count }` | On every connect/disconnect |
+| `display_mode` | `{ mode }` | Admin-driven display panel switch |
+| `error` | `{ code, message }` | Personal to sender only |
 
-### Client → Server Messages
+### Client → Server
 
-| `type` | Payload | Auth |
+| `type` | Key payload fields | Auth |
 |---|---|---|
-| `message` | `{ text }` | session token (cookie) |
-| `reaction` | `{ message_id, emoji }` | session token |
-| `question` | `{ text }` | session token |
-| `vote` | `{ question_id }` | session token |
-| `poll_vote` | `{ poll_id, option_index }` | session token |
-| `admin_lock` | `{ locked: bool, duration_seconds?: u32 }` | admin token |
-| `admin_delete_message` | `{ message_id }` | admin token |
-| `admin_pin_question` | `{ question_id }` | admin token |
-| `admin_dismiss_question` | `{ question_id }` | admin token |
-| `admin_create_poll` | `{ question, options: [string] }` | admin token |
-| `admin_close_poll` | `{ poll_id }` | admin token |
-| `admin_close_room` | `{}` | admin token |
+| `message` | `{ text }` | session |
+| `reaction` | `{ message_id, emoji }` | session |
+| `question` | `{ text }` | session |
+| `vote` | `{ question_id }` | session (toggle) |
+| `poll_vote` | `{ poll_id, option_index }` | session (once per poll) |
+| `admin_lock` | `{ locked, duration_seconds? }` | admin |
+| `admin_delete_message` | `{ message_id }` | admin |
+| `admin_approve_message` | `{ message_id }` | admin |
+| `admin_reject_message` | `{ message_id }` | admin |
+| `admin_pin_question` | `{ question_id }` | admin (toggle) |
+| `admin_answer_question` | `{ question_id }` | admin |
+| `admin_dismiss_question` | `{ question_id }` | admin |
+| `admin_approve_question` | `{ question_id }` | admin |
+| `admin_reject_question` | `{ question_id }` | admin |
+| `admin_create_poll` | `{ question, options: [string] }` | admin (2–6 options) |
+| `admin_close_poll` | `{ poll_id }` | admin |
+| `admin_delete_poll` | `{ poll_id }` | admin |
+| `admin_display_mode` | `{ mode }` | admin (`questions`\|`messages`\|`polls`\|`qr`) |
+| `admin_close_room` | `{}` | admin |
 
 ---
 
-## Test Scenarios
+## Persistence
 
-### Room Creation
+### Architecture
 
-- Create room with no password → public link and admin link returned
-- Create room with password → attendees without password cannot join
-- Create room with TTL of 1 hour → room state gone after TTL
-- Admin link with invalid token → 403
-- Two rooms with same room ID cannot exist simultaneously (collision → retry with new random ID)
+Postgres event sourcing. Two tables only. All writes are fire-and-forget (spawned tasks) so the DB
+is never in the broadcast hot path.
 
-### Chat
+**Schema** (`db/0001_initial.sql`):
 
-- Message sent by user appears for all connected users in < 500ms
-- User exceeding rate limit gets a transient error; message not sent
-- Admin deletes message → disappears for all users in real-time
-- Write lock enabled → chat input disabled for non-admin; admin can still post
-- Timed write lock of 2 minutes → unlocks automatically; chat input re-enables
-- Message > 500 chars → rejected with error
-- User disconnects and reconnects within TTL → same session token (cookie), sees message history
+```sql
+CREATE TABLE rooms (
+  id                  TEXT    PRIMARY KEY,
+  title               TEXT,
+  secret              TEXT    NOT NULL,
+  password_hash       TEXT,
+  expires_at          BIGINT,          -- epoch ms; NULL = never (test room)
+  max_messages        INT     NOT NULL,
+  max_participants    INT     NOT NULL,
+  rate_limit_ms       BIGINT  NOT NULL,
+  max_message_length  INT     NOT NULL,
+  moderated           BOOLEAN NOT NULL
+);
 
-### Q&A
+CREATE TABLE events (
+  id       BIGSERIAL PRIMARY KEY,      -- ordering key for replay
+  room_id  TEXT      NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+  ts       BIGINT    NOT NULL,         -- epoch ms
+  kind     TEXT      NOT NULL,
+  payload  TEXT      NOT NULL          -- JSON string
+);
 
-- Question submitted → appears on Q&A board for all users
-- Multiple users upvote same question → sorted to top in real-time
-- User tries to vote twice → second vote rejected
-- Admin pins question → appears at top regardless of vote count
-- Admin dismisses question → removed from board for all users
+CREATE INDEX ON events (room_id, id);  -- fast ordered replay per room
+```
 
-### Polls
+### Event kinds stored in DB
 
-- Admin creates poll → appears for all users immediately
-- User votes → results bar updates in real-time for all users
-- User tries to vote twice → rejected
-- Admin closes poll → voting disabled, final results shown
-- Second poll created after first is closed → both visible, only new one accepts votes
+| kind | payload fields |
+|---|---|
+| `message` | `{ id, role, text, ts }` |
+| `message_deleted` | `{ id }` |
+| `reaction_add` | `{ message_id, emoji, voter }` |
+| `reaction_remove` | `{ message_id, emoji, voter }` |
+| `pending_message` | `{ id, role, text, ts }` |
+| `pending_message_rejected` | `{ id }` |
+| `question` | `{ id, text }` |
+| `vote_add` | `{ question_id, voter }` |
+| `vote_remove` | `{ question_id, voter }` |
+| `question_pinned` | `{ question_id, pinned }` |
+| `question_answered` | `{ question_id }` |
+| `question_dismissed` | `{ question_id }` |
+| `pending_question` | `{ id, text }` |
+| `pending_question_rejected` | `{ id }` |
+| `poll_created` | `{ id, question, options: [{text}] }` |
+| `poll_vote` | `{ poll_id, option_index, voter }` |
+| `poll_closed` | `{ poll_id }` |
+| `poll_deleted` | `{ poll_id }` |
+| `lock` | `{ locked, until }` |
 
-### Reactions
+`pending_message` + `pending_message_rejected` pair: on replay, a `message` event with the same id
+removes the pending entry (approve path). A `pending_message_rejected` event drops it directly.
 
-- User reacts to message → count increments for all users
-- Same user reacts again → toggles off (count decrements)
+Timed lock auto-unlock is NOT persisted — `effective_locked()` checks `locked_until` vs wall clock
+on every access, so a lock whose deadline passed during downtime auto-expires on first read.
 
-### Admin Controls
+Session tokens are NOT persisted — users must rejoin after a server restart.
 
-- Admin closes room → all connected users see "room closed" and are redirected
-- Admin link opened in second browser → both sessions have admin privileges
-- Admin token not present → admin actions return 403
+### Startup replay
 
-### Load / Edge Cases
+1. Load all non-expired room rows from `rooms`.
+2. For each room, `SELECT kind, payload FROM events WHERE room_id = $1 ORDER BY id`.
+3. Apply each event via `RoomInner::apply_event` to reconstruct full in-memory state.
 
-- 200 concurrent WebSocket connections to one room → all receive broadcasts
-- Room with 0 connected users but within TTL → state preserved; next user to join sees history
-- Server restart during active room → all in-memory state lost; acceptable for ephemeral rooms
+### Write strategy
+
+1. Mutate in-memory state
+2. Broadcast to WebSocket subscribers
+3. `tokio::spawn` async DB write (never awaited before broadcast)
+
+A crash between steps 2 and 3 loses at most one in-flight event — acceptable.
 
 ---
 
 ## Deployment
 
-### Environment Variables
+### Production (Ubuntu VPS)
 
-```
-HOST=0.0.0.0
-PORT=8080
-BASE_URL=https://void.sh
-BCRYPT_COST=10
-DEFAULT_TTL_SECONDS=7200            # 2 hours; max 86400 (24h)
-MAX_TTL_SECONDS=86400
-DEFAULT_MAX_MESSAGES=200
-MAX_MESSAGES_PER_ROOM=1000
-DEFAULT_MAX_PARTICIPANTS=100
-MAX_PARTICIPANTS_PER_ROOM=500
-DEFAULT_RATE_LIMIT_SECONDS=3        # min gap between messages per session
-MAX_MESSAGE_LENGTH=500
-TTL_SWEEP_INTERVAL_SECONDS=60       # how often background task reaps expired rooms
+**Build and install:**
+
+```bash
+cargo build --release
+sudo cp target/release/void /usr/local/bin/void
 ```
 
-### Heroku
+Static assets are baked into the binary. CSS/JS changes require a rebuild.
 
-- `Procfile`: `web: ./void`
-- Set env vars via `heroku config:set`
-- Buildpack: `emk/heroku-buildpack-rust` or pre-build binary and use container stack
-- WebSockets supported natively on Heroku; no special config needed
-- **Note**: Heroku free dynos sleep after 30 min inactivity — use Basic dyno ($5/mo) for a live talk
-- **Note**: in-memory state is lost on dyno restart; acceptable for ephemeral rooms
+**Local Postgres:**
 
-### Fly.io (recommended over Heroku)
+```bash
+sudo apt install postgresql
+sudo -u postgres createdb void
+sudo -u postgres createuser --superuser ext   # match the OS user void runs as
+```
 
-- `fly.toml` with single `[http_service]` block; WebSockets work out of the box
-- `fly deploy` builds via Dockerfile; no add-ons needed
-- **Note**: in-memory state is lost on VM restart; acceptable for ephemeral rooms; single instance only (no horizontal scaling in v1)
-- Free tier sufficient for conference use; persistent VM, no sleep
-- Closest region selectable — important for latency during a live talk
+**systemd unit** (`/etc/systemd/system/void.service`):
 
-### Render
+```ini
+[Unit]
+Description=0xff.wtf
+After=network.target
 
-- Docker-based deploy; no add-ons needed
-- Free tier has cold starts — use paid ($7/mo) for live use
+[Service]
+ExecStart=/usr/local/bin/void
+Restart=always
+RestartSec=5
+User=ext
+Environment=HOST=127.0.0.1
+Environment=PORT=8080
+Environment=BASE_URL=https://0xff.wtf
+Environment=DATABASE_URL=postgresql:///void?host=/var/run/postgresql&user=ext
 
-### Self-hosted (VPS)
+[Install]
+WantedBy=multi-user.target
+```
 
-- Single binary + systemd unit file
-- Nginx reverse proxy for TLS termination:
+For secrets, use an `EnvironmentFile=/etc/void/env` (mode `600`) instead of inline `Environment=`.
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now void
+```
+
+**Nginx** (TLS termination + WebSocket upgrade):
 
 ```nginx
 server {
     listen 443 ssl;
-    server_name void.sh;
+    server_name 0xff.wtf;
 
-    ssl_certificate     /etc/letsencrypt/live/void.sh/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/void.sh/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/0xff.wtf/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/0xff.wtf/privkey.pem;
 
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";  # required for WebSocket
+        proxy_set_header Connection "upgrade";
         proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;   # required for IP rate limiting
     }
 }
 ```
 
-### TLS / Let's Encrypt (self-hosted)
+**TLS:**
 
-- Install Certbot: `apt install certbot python3-certbot-nginx`
-- Issue cert: `certbot --nginx -d void.sh`
-- Auto-renewal via systemd timer (installed by certbot automatically); verify with `systemctl status certbot.timer`
-- Wildcard cert not needed unless running multi-tenant subdomains per room
+```bash
+apt install certbot python3-certbot-nginx
+certbot --nginx -d 0xff.wtf
+```
 
 ### Docker
 
@@ -400,131 +397,76 @@ CMD ["void"]
 
 ---
 
-## Persistence
+## Troubleshooting
 
-### Goals
+**Service fails to start:**
 
-All room state survives server restarts within the room's TTL. Free and paid rooms
-are treated identically — persistence is not a differentiator; longevity and custom
-URLs are.
-
-### Architecture
-
-**Postgres (Neon)** + **SQLx**. Two tables only.
-
-```sql
--- Room metadata: fast lookup without replaying events.
-CREATE TABLE rooms (
-  id                 TEXT PRIMARY KEY,
-  title              TEXT,
-  secret             TEXT NOT NULL,
-  password_hash      TEXT,
-  expires_at         BIGINT NOT NULL,   -- epoch ms
-  created_at         BIGINT NOT NULL,
-  max_messages       INT NOT NULL,
-  max_participants   INT NOT NULL,
-  rate_limit_ms      BIGINT NOT NULL,
-  max_message_length INT NOT NULL,
-  moderated          BOOLEAN NOT NULL DEFAULT FALSE
-);
-
--- Append-only event log: one row per state-changing action.
-CREATE TABLE events (
-  seq      BIGSERIAL,
-  room_id  TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-  type     TEXT NOT NULL,
-  payload  JSONB NOT NULL,
-  ts       BIGINT NOT NULL   -- epoch ms
-);
-
-CREATE INDEX ON events (room_id, seq);   -- fast ordered replay per room
-CREATE INDEX ON rooms (expires_at);      -- fast TTL sweep
+```bash
+sudo journalctl -u void -n 50
 ```
 
-### Event types
+**`Peer authentication failed for user "anonymous"`** — sqlx defaults username to `"anonymous"`.
+Fix: add `&user=<os-user>` to `DATABASE_URL`.
 
-Storage payloads carry more data than broadcast payloads (e.g. `identity` for
-dedup replay) but are never sent to clients.
+**`Peer authentication failed for user "ext"` (works in shell but not service)** — service runs as
+wrong OS user. Add `User=ext` to `[Service]` and `daemon-reload`.
 
-| type | payload |
-|---|---|
-| `session_joined` | `{ token }` |
-| `message_posted` | `{ id, role, text, ts, identity }` |
-| `message_deleted` | `{ message_id }` |
-| `reaction_toggled` | `{ message_id, emoji, identity }` |
-| `pending_msg_posted` | `{ id, role, text, ts, identity }` |
-| `pending_msg_approved` | `{ message_id }` |
-| `pending_msg_rejected` | `{ message_id }` |
-| `question_posted` | `{ id, text }` |
-| `question_voted` | `{ question_id, identity }` |
-| `question_pinned` | `{ question_id, pinned }` |
-| `question_answered` | `{ question_id }` |
-| `question_dismissed` | `{ question_id }` |
-| `pending_q_posted` | `{ id, text }` |
-| `pending_q_approved` | `{ question_id }` |
-| `pending_q_rejected` | `{ question_id }` |
-| `poll_created` | `{ id, question, options: [text] }` |
-| `poll_voted` | `{ poll_id, option_idx, identity }` |
-| `poll_closed` | `{ poll_id }` |
-| `poll_deleted` | `{ poll_id }` |
-| `room_lock_changed` | `{ locked }` |
+**`migration failed` on startup** — `db/` is embedded at compile time via `sqlx::migrate!("./db")`.
+Rebuild from repo root.
 
-No `room_created` event — the `rooms` row is the source of truth for metadata.
-No `room_closed` event — `DELETE FROM rooms` cascades to events.
+**Room state not surviving restart** — verify `DATABASE_URL` is in service env:
+`sudo systemctl show void --property=Environment`. Look for `VOID db connected and migrations
+applied` in logs.
 
-### Write strategy
+**WebSocket connections failing (nginx)** — ensure both `Upgrade` and `Connection: upgrade` headers
+are forwarded (see nginx config above).
 
-The DB is **never in the broadcast hot path**:
+---
 
-1. Mutate in-memory state
-2. Broadcast to WebSocket subscribers
-3. Fire async DB write (no await before broadcast)
+## Known Limitations / Design Decisions
 
-Clients never wait on Postgres. A crash between steps 2 and 3 loses at most the
-last in-flight event — acceptable for a conference room tool.
+- **Session tokens reset on restart** — users must rejoin; no persistent session store.
+- **`myVotes` is client-side only** — vote highlight resets on page refresh (server count is always
+  correct; it's just the UI indicator that forgets).
+- **Single instance** — no cross-instance broadcast; scale vertically or add sticky routing + Postgres
+  NOTIFY when needed.
+- **No recap** — room state is wiped on expiry; paid tier recap export not yet built.
+- **Test room** (`/r/test`) — always exists, never persisted, used for development.
+- **Sessions not persisted** — intentional; prevents indefinite session accumulation without accounts.
 
-Rate limiting state (`last_message_at`) is intentionally not persisted; it resets
-on restart.
+---
 
-### Startup replay
+## Free vs Paid (planned)
 
-```
-SELECT * FROM rooms WHERE expires_at > now_ms();
-```
+See `paid-vs-free.md` for the full comparison. Key differences:
 
-For each room, replay its events in `seq` order to reconstruct the full
-`RoomInner`: messages (with reactions), questions (votes, voter sets, pinned,
-answered), polls (options, votes, voter sets), pending queues, sessions, lock
-state.
+| | Free | Paid |
+|---|---|---|
+| TTL | up to 3 h | up to 30 days |
+| URL | random hex | custom slug (email-verified, manual approval) |
+| Participants | max 20 | unlimited |
+| Topics | one at a time | multiple simultaneous |
+| Ownership | admin URL only | email on file, secret reset available |
+| Price | free | $20/day/room; $50/day for custom slug |
 
-`next_msg_id`, `next_question_id`, `next_poll_id` are derived from the max IDs
-seen during replay.
+---
 
-Lock state: `effective_locked()` already checks `locked_until` against wall clock,
-so a timed lock whose deadline passed during downtime auto-expires on first access.
+## Future Work (priority order)
 
-### TTL sweep
+1. **Topics** — `topics: Vec<String>` on `Room` (set at creation or via `admin_set_topics` action);
+   `topic: Option<String>` on `Message` and `Question`; client filters/subscribes per topic;
+   free users select one topic, paid users multi-select. DB: add `topics TEXT[]` to rooms,
+   `topic TEXT` to event payloads.
 
-```sql
-DELETE FROM rooms WHERE expires_at < $1;
-```
+2. **Paid tier + payments** — Stripe integration; custom slug creation flow (email OTP for domain
+   verification, e.g. `*@eurorust.eu` for slug `eurorust2026`); 30-day room TTL; unlimited caps.
 
-`ON DELETE CASCADE` removes all events for expired rooms. Sweep runs on the same
-interval as the in-memory reap (`TTL_SWEEP_INTERVAL_SECONDS`).
+3. **Recap export** — on room expiry (paid only), dump all events to JSON/PDF and email to owner.
 
-### Scalability notes
+4. **Email ownership** — store admin email at room creation (paid); allow admin secret reset via
+   email OTP link.
 
-The `(room_id, seq)` index makes replay queries touch only that room's rows —
-functionally equivalent to table-per-room for read performance. At conference room
-scale (thousands of rooms, hundreds of events each) Postgres handles this without
-issue. Partitioning by time range is available if the table grows into the hundreds
-of millions of rows.
+5. **Monitoring** — `/health` endpoint, structured JSON logs, Sentry or similar for error tracking.
 
-## Future Work
-
-- **Multi-instance scaling** — sticky sessions by room_id; Postgres NOTIFY or
-  Redis pub/sub for cross-instance broadcast
-- **Paid tier** — custom URL slugs, 30-day TTL, unlimited caps, recap export on
-  expiry (JSON / PDF); Stripe + crypto payments
-- **User accounts** — optional persistent identity across rooms (v3)
-- **Mobile app** — React Native (v3)
+6. **Multi-instance** — sticky routing by room_id at load balancer; Postgres NOTIFY for cross-instance
+   broadcast; or Redis pub/sub.

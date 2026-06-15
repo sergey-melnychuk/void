@@ -299,9 +299,11 @@ fn handle_client(
                 if room.cfg.moderated && !is_admin {
                     inner.pending_messages.push(msg.clone());
                     drop(inner);
+                    let pp = json!({"id": msg.id, "role": &msg.role, "text": &msg.text, "ts": msg.ts});
                     let ev = json!({ "type": "pending_message", "payload": msg });
                     let _ = ptx.send(ev.to_string()); // submitter sees their own pending item
-                    room.broadcast_admin(ev); // admins see it in their queue
+                    room.broadcast_admin(ev);
+                    persist(app, &room.id, "pending_message", pp);
                     return;
                 }
                 inner.messages.push_back(msg.clone());
@@ -406,9 +408,11 @@ fn handle_client(
                 if room.cfg.moderated && !is_admin {
                     inner.pending_questions.push(q.clone());
                     drop(inner);
+                    let pp = json!({"id": q.id, "text": &q.text});
                     let ev = json!({ "type": "pending_question", "payload": q });
                     let _ = ptx.send(ev.to_string());
                     room.broadcast_admin(ev);
+                    persist(app, &room.id, "pending_question", pp);
                     return;
                 }
                 inner.questions.push(q.clone());
@@ -549,11 +553,8 @@ fn handle_client(
             let Some(mid) = p.get("message_id").and_then(Value::as_u64) else {
                 return;
             };
-            room.inner
-                .lock()
-                .unwrap()
-                .pending_messages
-                .retain(|m| m.id != mid);
+            room.inner.lock().unwrap().pending_messages.retain(|m| m.id != mid);
+            persist(app, &room.id, "pending_message_rejected", json!({"id": mid}));
             room.broadcast(json!({ "type": "pending_message_rejected", "payload": { "id": mid } }));
         }
 
@@ -585,14 +586,9 @@ fn handle_client(
             let Some(qid) = p.get("question_id").and_then(Value::as_u64) else {
                 return;
             };
-            room.inner
-                .lock()
-                .unwrap()
-                .pending_questions
-                .retain(|q| q.id != qid);
-            room.broadcast(
-                json!({ "type": "pending_question_rejected", "payload": { "id": qid } }),
-            );
+            room.inner.lock().unwrap().pending_questions.retain(|q| q.id != qid);
+            persist(app, &room.id, "pending_question_rejected", json!({"id": qid}));
+            room.broadcast(json!({ "type": "pending_question_rejected", "payload": { "id": qid } }));
         }
 
         "admin_lock" => {

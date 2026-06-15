@@ -257,6 +257,22 @@ impl RoomInner {
     /// in ws.rs::handle_client but without broadcasting or side-effects.
     pub fn apply_event(&mut self, kind: &str, p: &Value) {
         match kind {
+            "pending_message" => {
+                if let (Some(id), Some(role), Some(text), Some(ts)) = (
+                    p["id"].as_u64(), p["role"].as_str(), p["text"].as_str(), p["ts"].as_u64(),
+                ) {
+                    self.next_msg_id = self.next_msg_id.max(id);
+                    self.pending_messages.push(Message {
+                        id, role: role.to_string(), text: text.to_string(), ts,
+                        reactions: BTreeMap::new(),
+                    });
+                }
+            }
+            "pending_message_rejected" => {
+                if let Some(id) = p["id"].as_u64() {
+                    self.pending_messages.retain(|m| m.id != id);
+                }
+            }
             "message" => {
                 if let (Some(id), Some(role), Some(text), Some(ts)) = (
                     p["id"].as_u64(),
@@ -265,6 +281,7 @@ impl RoomInner {
                     p["ts"].as_u64(),
                 ) {
                     self.next_msg_id = self.next_msg_id.max(id);
+                    self.pending_messages.retain(|m| m.id != id); // promoted from pending
                     self.messages.push_back(Message {
                         id,
                         role: role.to_string(),
@@ -280,9 +297,23 @@ impl RoomInner {
                     self.reaction_users.retain(|(mid, _), _| *mid != id);
                 }
             }
+            "pending_question" => {
+                if let (Some(id), Some(text)) = (p["id"].as_u64(), p["text"].as_str()) {
+                    self.next_question_id = self.next_question_id.max(id);
+                    self.pending_questions.push(Question {
+                        id, text: text.to_string(), votes: 0, pinned: false, answered: false,
+                    });
+                }
+            }
+            "pending_question_rejected" => {
+                if let Some(id) = p["id"].as_u64() {
+                    self.pending_questions.retain(|q| q.id != id);
+                }
+            }
             "question" => {
                 if let (Some(id), Some(text)) = (p["id"].as_u64(), p["text"].as_str()) {
                     self.next_question_id = self.next_question_id.max(id);
+                    self.pending_questions.retain(|q| q.id != id); // promoted from pending
                     self.questions.push(Question {
                         id,
                         text: text.to_string(),
