@@ -63,7 +63,13 @@ fn room_id(created: &Value) -> String {
     created["room_id"].as_str().unwrap().to_string()
 }
 fn secret(created: &Value) -> String {
-    created["admin_url"].as_str().unwrap().rsplit('/').next().unwrap().to_string()
+    created["admin_url"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_string()
 }
 
 /// Join as a user; returns (status, session_token option).
@@ -153,11 +159,22 @@ async fn serves_embedded_frontend() {
     let base = spawn().await;
     let index = reqwest::get(format!("{base}/")).await.unwrap();
     assert_eq!(index.status(), 200);
-    assert!(index.headers()["content-type"].to_str().unwrap().contains("html"));
+    assert!(
+        index.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .contains("html")
+    );
 
     let js = reqwest::get(format!("{base}/assets/app.js")).await.unwrap();
     assert_eq!(js.status(), 200);
-    assert!(reqwest::get(format!("{base}/assets/missing.js")).await.unwrap().status() == 404);
+    assert!(
+        reqwest::get(format!("{base}/assets/missing.js"))
+            .await
+            .unwrap()
+            .status()
+            == 404
+    );
 }
 
 #[tokio::test]
@@ -167,8 +184,18 @@ async fn create_returns_links() {
     let id = room_id(&room);
     assert_eq!(id.len(), 6);
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
-    assert!(room["public_url"].as_str().unwrap().ends_with(&format!("/r/{id}")));
-    assert!(room["admin_url"].as_str().unwrap().contains(&format!("/r/{id}/")));
+    assert!(
+        room["public_url"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("/r/{id}"))
+    );
+    assert!(
+        room["admin_url"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("/r/{id}/"))
+    );
 }
 
 #[tokio::test]
@@ -222,15 +249,24 @@ async fn write_lock_blocks_users_not_admin() {
     let mut user = user_ws(&base, &room).await;
 
     send(&mut admin, "admin_lock", json!({ "locked": true })).await;
-    assert_eq!(wait_for(&mut user, "lock").await.unwrap()["payload"]["locked"], true);
+    assert_eq!(
+        wait_for(&mut user, "lock").await.unwrap()["payload"]["locked"],
+        true
+    );
 
     // User's message is rejected with a personal error, not broadcast.
     send(&mut user, "message", json!({ "text": "blocked?" })).await;
-    assert_eq!(wait_for(&mut user, "error").await.unwrap()["payload"]["code"], "locked");
+    assert_eq!(
+        wait_for(&mut user, "error").await.unwrap()["payload"]["code"],
+        "locked"
+    );
 
     // Admin can still post while locked.
     send(&mut admin, "message", json!({ "text": "presenter" })).await;
-    assert_eq!(wait_for(&mut user, "message").await.unwrap()["payload"]["text"], "presenter");
+    assert_eq!(
+        wait_for(&mut user, "message").await.unwrap()["payload"]["text"],
+        "presenter"
+    );
 }
 
 #[tokio::test]
@@ -243,7 +279,10 @@ async fn rate_limit_enforced_per_session() {
     assert!(wait_for(&mut user, "message").await.is_some());
 
     send(&mut user, "message", json!({ "text": "too soon" })).await;
-    assert_eq!(wait_for(&mut user, "error").await.unwrap()["payload"]["code"], "rate_limited");
+    assert_eq!(
+        wait_for(&mut user, "error").await.unwrap()["payload"]["code"],
+        "rate_limited"
+    );
 }
 
 #[tokio::test]
@@ -254,7 +293,10 @@ async fn message_length_capped() {
 
     let long = "x".repeat(501);
     send(&mut user, "message", json!({ "text": long })).await;
-    assert_eq!(wait_for(&mut user, "error").await.unwrap()["payload"]["code"], "too_long");
+    assert_eq!(
+        wait_for(&mut user, "error").await.unwrap()["payload"]["code"],
+        "too_long"
+    );
 }
 
 #[tokio::test]
@@ -268,10 +310,16 @@ async fn question_one_vote_per_user() {
     let qid = q["payload"]["id"].as_u64().unwrap();
 
     send(&mut user, "vote", json!({ "question_id": qid })).await;
-    assert_eq!(wait_for(&mut user, "vote").await.unwrap()["payload"]["votes"], 1);
+    assert_eq!(
+        wait_for(&mut user, "vote").await.unwrap()["payload"]["votes"],
+        1
+    );
 
     send(&mut user, "vote", json!({ "question_id": qid })).await;
-    assert_eq!(wait_for(&mut user, "error").await.unwrap()["payload"]["code"], "already_voted");
+    assert_eq!(
+        wait_for(&mut user, "error").await.unwrap()["payload"]["code"],
+        "already_voted"
+    );
 }
 
 #[tokio::test]
@@ -281,16 +329,34 @@ async fn poll_vote_once_then_close() {
     let mut admin = admin_ws(&base, &room).await;
     let mut user = user_ws(&base, &room).await;
 
-    send(&mut admin, "admin_create_poll", json!({ "question": "best?", "options": ["a", "b"] })).await;
+    send(
+        &mut admin,
+        "admin_create_poll",
+        json!({ "question": "best?", "options": ["a", "b"] }),
+    )
+    .await;
     let poll = wait_for(&mut user, "poll_created").await.unwrap();
     let pid = poll["payload"]["id"].as_u64().unwrap();
 
-    send(&mut user, "poll_vote", json!({ "poll_id": pid, "option_index": 1 })).await;
+    send(
+        &mut user,
+        "poll_vote",
+        json!({ "poll_id": pid, "option_index": 1 }),
+    )
+    .await;
     let update = wait_for(&mut user, "poll_update").await.unwrap();
     assert_eq!(update["payload"]["options"][1]["votes"], 1);
 
-    send(&mut user, "poll_vote", json!({ "poll_id": pid, "option_index": 0 })).await;
-    assert_eq!(wait_for(&mut user, "error").await.unwrap()["payload"]["code"], "already_voted");
+    send(
+        &mut user,
+        "poll_vote",
+        json!({ "poll_id": pid, "option_index": 0 }),
+    )
+    .await;
+    assert_eq!(
+        wait_for(&mut user, "error").await.unwrap()["payload"]["code"],
+        "already_voted"
+    );
 
     send(&mut admin, "admin_close_poll", json!({ "poll_id": pid })).await;
     assert!(wait_for(&mut user, "poll_closed").await.is_some());
@@ -302,8 +368,16 @@ async fn invalid_poll_rejected() {
     let room = create_room(&base, json!({})).await;
     let mut admin = admin_ws(&base, &room).await;
 
-    send(&mut admin, "admin_create_poll", json!({ "question": "q", "options": ["only one"] })).await;
-    assert_eq!(wait_for(&mut admin, "error").await.unwrap()["payload"]["code"], "bad_poll");
+    send(
+        &mut admin,
+        "admin_create_poll",
+        json!({ "question": "q", "options": ["only one"] }),
+    )
+    .await;
+    assert_eq!(
+        wait_for(&mut admin, "error").await.unwrap()["payload"]["code"],
+        "bad_poll"
+    );
 }
 
 #[tokio::test]
@@ -313,13 +387,31 @@ async fn reaction_toggles() {
     let mut user = user_ws(&base, &room).await;
 
     send(&mut user, "message", json!({ "text": "react to me" })).await;
-    let mid = wait_for(&mut user, "message").await.unwrap()["payload"]["id"].as_u64().unwrap();
+    let mid = wait_for(&mut user, "message").await.unwrap()["payload"]["id"]
+        .as_u64()
+        .unwrap();
 
-    send(&mut user, "reaction", json!({ "message_id": mid, "emoji": "🔥" })).await;
-    assert_eq!(wait_for(&mut user, "reaction").await.unwrap()["payload"]["count"], 1);
+    send(
+        &mut user,
+        "reaction",
+        json!({ "message_id": mid, "emoji": "🔥" }),
+    )
+    .await;
+    assert_eq!(
+        wait_for(&mut user, "reaction").await.unwrap()["payload"]["count"],
+        1
+    );
 
-    send(&mut user, "reaction", json!({ "message_id": mid, "emoji": "🔥" })).await;
-    assert_eq!(wait_for(&mut user, "reaction").await.unwrap()["payload"]["count"], 0);
+    send(
+        &mut user,
+        "reaction",
+        json!({ "message_id": mid, "emoji": "🔥" }),
+    )
+    .await;
+    assert_eq!(
+        wait_for(&mut user, "reaction").await.unwrap()["payload"]["count"],
+        0
+    );
 }
 
 #[tokio::test]
@@ -329,7 +421,10 @@ async fn admin_actions_require_admin_token() {
     let mut user = user_ws(&base, &room).await;
 
     send(&mut user, "admin_lock", json!({ "locked": true })).await;
-    assert_eq!(wait_for(&mut user, "error").await.unwrap()["payload"]["code"], "forbidden");
+    assert_eq!(
+        wait_for(&mut user, "error").await.unwrap()["payload"]["code"],
+        "forbidden"
+    );
 }
 
 #[tokio::test]
@@ -340,10 +435,20 @@ async fn admin_delete_message() {
     let mut user = user_ws(&base, &room).await;
 
     send(&mut user, "message", json!({ "text": "delete me" })).await;
-    let mid = wait_for(&mut user, "message").await.unwrap()["payload"]["id"].as_u64().unwrap();
+    let mid = wait_for(&mut user, "message").await.unwrap()["payload"]["id"]
+        .as_u64()
+        .unwrap();
 
-    send(&mut admin, "admin_delete_message", json!({ "message_id": mid })).await;
-    assert_eq!(wait_for(&mut user, "message_deleted").await.unwrap()["payload"]["id"], mid);
+    send(
+        &mut admin,
+        "admin_delete_message",
+        json!({ "message_id": mid }),
+    )
+    .await;
+    assert_eq!(
+        wait_for(&mut user, "message_deleted").await.unwrap()["payload"]["id"],
+        mid
+    );
 }
 
 #[tokio::test]
@@ -402,15 +507,38 @@ async fn two_admins_vote_independently() {
     let mut a1 = admin_ws(&base, &room).await;
     let mut a2 = admin_ws(&base, &room).await;
 
-    send(&mut a1, "admin_create_poll", json!({ "question": "q", "options": ["x", "y"] })).await;
-    let pid = wait_for(&mut a1, "poll_created").await.unwrap()["payload"]["id"].as_u64().unwrap();
+    send(
+        &mut a1,
+        "admin_create_poll",
+        json!({ "question": "q", "options": ["x", "y"] }),
+    )
+    .await;
+    let pid = wait_for(&mut a1, "poll_created").await.unwrap()["payload"]["id"]
+        .as_u64()
+        .unwrap();
 
-    send(&mut a1, "poll_vote", json!({ "poll_id": pid, "option_index": 0 })).await;
-    assert_eq!(wait_for(&mut a1, "poll_update").await.unwrap()["payload"]["options"][0]["votes"], 1);
+    send(
+        &mut a1,
+        "poll_vote",
+        json!({ "poll_id": pid, "option_index": 0 }),
+    )
+    .await;
+    assert_eq!(
+        wait_for(&mut a1, "poll_update").await.unwrap()["payload"]["options"][0]["votes"],
+        1
+    );
     // Second admin is a separate identity, so its vote is NOT rejected — a1 sees
     // the count climb to 2 (a rejected duplicate would yield no further update).
-    send(&mut a2, "poll_vote", json!({ "poll_id": pid, "option_index": 0 })).await;
-    assert_eq!(wait_for(&mut a1, "poll_update").await.unwrap()["payload"]["options"][0]["votes"], 2);
+    send(
+        &mut a2,
+        "poll_vote",
+        json!({ "poll_id": pid, "option_index": 0 }),
+    )
+    .await;
+    assert_eq!(
+        wait_for(&mut a1, "poll_update").await.unwrap()["payload"]["options"][0]["votes"],
+        2
+    );
 }
 
 #[tokio::test]
@@ -420,8 +548,16 @@ async fn timed_lock_auto_unlocks() {
     let mut admin = admin_ws(&base, &room).await;
     let mut user = user_ws(&base, &room).await;
 
-    send(&mut admin, "admin_lock", json!({ "locked": true, "duration_seconds": 1 })).await;
-    assert_eq!(wait_for(&mut user, "lock").await.unwrap()["payload"]["locked"], true);
+    send(
+        &mut admin,
+        "admin_lock",
+        json!({ "locked": true, "duration_seconds": 1 }),
+    )
+    .await;
+    assert_eq!(
+        wait_for(&mut user, "lock").await.unwrap()["payload"]["locked"],
+        true
+    );
 
     // The auto-unlock event arrives once the timer fires (~1s).
     let unlock = tokio::time::timeout(Duration::from_secs(3), async {
@@ -454,7 +590,9 @@ async fn state_bearer_scheme_case_insensitive() {
     assert_eq!(resp.status(), 200);
 
     // A query-param token is NOT accepted — it must never be a usable channel.
-    let via_query = reqwest::get(format!("{base}/r/{id}/state?token={token}")).await.unwrap();
+    let via_query = reqwest::get(format!("{base}/r/{id}/state?token={token}"))
+        .await
+        .unwrap();
     assert_eq!(via_query.status(), 403);
 }
 

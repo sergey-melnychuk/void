@@ -3,71 +3,100 @@
 Ephemeral chat rooms for live sessions — conference talks, workshops, Q&A.
 
 A presenter spins up a room, drops a short link on a slide, and the whole thing
-evaporates when the session ends. No accounts, no database, no persistence, no
-noise.
+evaporates when the session ends. No accounts, no noise.
+
+Live at **[0xff.wtf](https://0xff.wtf)**.
 
 ## Why
 
 Live audiences need a back-channel: chat, questions, quick polls. Existing tools
-demand sign-ups, retain data forever, or are heavyweight to run. VOID is a single
-binary you can deploy in minutes. State lives in memory and is wiped on a TTL —
-nothing to clean up, no PII to leak.
+demand sign-ups, retain data forever, or cost a fortune. VOID is a single binary
+you can deploy in minutes. Rooms are ephemeral by design — nothing to clean up,
+no PII to leak.
 
 ## Features
 
-- **Rooms in one request** — `POST /rooms`, no account. Optional password, a TTL
-  (default 2h, max 24h), and a hard cap on participants and message history.
-- **Two roles, no identity** — `admin` (holds the secret link) and `user`
-  (everyone else). Messages are anonymous; only a role badge is shown.
-- **Real-time chat** — WebSocket broadcast, per-user rate limiting, 500-char cap,
-  emoji reactions, admin message deletion, and a global write lock (timed or
-  indefinite) for talk-then-Q&A flow.
-- **Q&A board** — attendees submit questions, upvote (one vote each); admin pins
-  the one being answered and dismisses the rest.
-- **Polls** — admin-created multiple choice (2–6 options) with live results;
-  one vote per user, enforced server-side.
+### Rooms
+- **One request to create** — no account. Optional password, TTL, participant cap, rate limit, optional title.
+- **Two tiers** — free (3h, 20 participants, 100 messages, 10 questions, 1 poll) and paid ($20/day, 30-day TTL, custom URL slug, unlimited everything, recap export on expiry).
+- **Two roles** — `admin` (holds the secret link) and `user` (everyone else). Messages are anonymous; only a role badge is shown.
+- **Moderated mode** — admin approves every message and question before it's visible to others.
+- **Write lock** — admin can freeze chat (read-only); attendees see a banner.
+- **Manual close** — admin can close the room early; all clients notified.
+
+### Chat
+- Real-time WebSocket broadcast
+- Per-user rate limiting (server-enforced)
+- 500-char message cap
+- Emoji reactions (👍 ❤️ 😂 🔥 🤔) with toggle — one reaction entry per user per emoji
+- Admin message deletion
+- Pending state for moderated rooms (submitter sees dim "awaiting approval", red if dropped)
+
+### Q&A
+- Attendees submit questions; sorted by votes descending
+- **Upvote / un-vote** — toggle; one vote per user, enforced server-side
+- **Admin pin** — pinned question floats to top regardless of votes
+- **Admin answer** — marks question as answered; sinks to bottom, dimmed, no more votes
+- **Admin dismiss** — removes question entirely
+- Moderation support (pending queue for admin)
+
+### Polls
+- Admin-created, 2–6 options, live results
+- One vote per user, enforced server-side
+- Admin close (freezes results) and delete
+- Multiple polls per room
+
+### Display window
+- Admin opens a detached presentation window (`/w/<room_id>`) — same 3-column view without any controls
+- QR code widget fixed to the bottom-right corner (public room URL, full column width, capped at 50% height)
+- Press **F** to toggle fullscreen
+- Display connections are invisible: not counted in presence, all input server-rejected
+
+### Admin controls
+- Lock / unlock room
+- Close room
+- Approve / reject pending messages and questions (moderated mode)
+- Pin / answer / dismiss questions
+- Create / close / delete polls
+- Open display window
 
 ## How it works
 
-- **Public link** — `void.sh/r/<room_id>` (6 hex chars). Safe to share on a slide.
-- **Private link** — `void.sh/r/<room_id>/<secret>` (16-byte secret). Shown once at
-  creation; whoever holds it is admin. The admin token is derived
-  `HMAC-SHA256(secret, room_id)` and recomputed server-side on every privileged
-  action — never stored.
+- **Public link** — `0xff.wtf/r/<room_id>` — share on a slide
+- **Admin link** — `0xff.wtf/r/<room_id>/<secret>` — shown once at creation; whoever holds it is admin
+- **Admin token** — derived as `HMAC-SHA256(secret, room_id)`; recomputed server-side on every privileged action; never stored
+- **Display link** — `0xff.wtf/w/<room_id>` — read-only presentation view, no controls
 
-All room state (messages, questions, polls, participants) lives entirely in
-process memory. A background task sweeps expired rooms. Restart the server and
-ephemeral rooms are gone by design.
+Session tokens are minted on join, stored in `localStorage`, and reused for reconnect within TTL. No cookies.
 
 ## Tech stack
 
 | Layer | Choice |
 |---|---|
-| Backend | Rust / [Axum](https://github.com/tokio-rs/axum) — JSON API + WebSocket |
-| State | In-process `DashMap`, `VecDeque` per room for capped history |
-| Broadcast | `tokio::sync::broadcast`, one channel per room |
-| Frontend | Vue 3 via CDN (`esm.sh`), Composition API — no build step |
-| Assets | `rust-embed` — static HTML/JS/CSS bundled into the binary, single-file deploy |
+| Backend | Rust / Axum — JSON REST + WebSocket |
+| State | In-process `DashMap`; `tokio::sync::broadcast` per room |
+| Persistence | Postgres (Neon) + SQLx — event log, survives restarts |
+| Frontend | Vue 3 via CDN (`esm.sh`), Composition API — **no build step** |
+| Assets | `rust-embed` — HTML/JS/CSS bundled into the binary |
+| TLS | Caddy — automatic Let's Encrypt |
 | Config | ENV vars (12-factor) |
 
-No database, no Redis, no external services in v1. No frontend toolchain either —
-the UI is plain files served straight from the binary. `cargo build` is the only
-build step. Single binary, target < 20MB.
+Single binary. `cargo build` is the only build step. No Node, no npm, no bundler.
 
 ## API surface
 
-REST is minimal; everything after join goes over WebSocket.
-
 ```
-POST  /rooms              Create room → { room_id, public_url, admin_url }
-GET   /r/:room_id         Serve the SPA
-GET   /r/:room_id/state   Initial room state snapshot
-WS    /r/:room_id/ws      WebSocket; ?token=<session|admin>
-GET   /assets/*           Static JS/CSS
+POST  /rooms                Create room → { room_id, public_url, admin_url }
+POST  /r/:id/join           Join room → { session_token, state }
+GET   /r/:id/state          Admin state snapshot (requires admin token)
+WS    /r/:id/ws             WebSocket — token in Sec-WebSocket-Protocol header
+GET   /r/:id                Serve SPA
+GET   /r/:id/:secret        Serve SPA (admin entry)
+GET   /w/:id                Serve SPA (display window entry)
+GET   /assets/*             Embedded static assets
 ```
 
-See [VOID.md](./VOID.md) for the full WebSocket protocol, security model, and
-test scenarios.
+See [VOID.md](./VOID.md) for the full WebSocket protocol and security model.
 
 ## Development
 
@@ -75,41 +104,40 @@ test scenarios.
 cargo run
 ```
 
-That's it — no Node, no npm, no bundler. The frontend is static files
-(`index.html` + Vue loaded from a CDN) embedded via `rust-embed` and served by
-the binary. Edit the files and rebuild.
+Test room always available at `localhost:8080/r/test/test` (admin).
 
 ## Configuration
-
-Configured entirely through environment variables:
 
 ```
 HOST=0.0.0.0
 PORT=8080
-BASE_URL=https://void.sh
-DEFAULT_TTL_SECONDS=7200        # max 86400 (24h)
-DEFAULT_MAX_MESSAGES=200        # max 1000
-DEFAULT_MAX_PARTICIPANTS=100    # max 500
+BASE_URL=https://0xff.wtf
+DATABASE_URL=postgres://...         # Neon connection string
+BCRYPT_COST=10
+DEFAULT_TTL_SECONDS=7200
+DEFAULT_MAX_MESSAGES=200
+DEFAULT_MAX_PARTICIPANTS=100
 DEFAULT_RATE_LIMIT_SECONDS=3
 MAX_MESSAGE_LENGTH=500
 TTL_SWEEP_INTERVAL_SECONDS=60
 ```
 
-See [VOID.md](./VOID.md#deployment) for the full list and deployment notes
-(Fly.io, Heroku, Render, Docker, self-hosted).
-
 ## Deployment
 
-Single binary or container. Fly.io is recommended (WebSockets out of the box, no
-add-ons, no dyno sleep):
+Single binary behind Caddy on a VPS (currently DigitalOcean). Caddy handles TLS automatically.
 
-```sh
-fly deploy
+```
+/etc/caddy/Caddyfile:
+
+0xff.wtf {
+    reverse_proxy localhost:8080
+}
 ```
 
-In-memory state is lost on restart — acceptable and intended for ephemeral rooms.
-Single instance only in v1; multi-instance scaling is future work.
+Systemd unit keeps the binary running and restarts on crash. Room state survives
+restarts via Postgres event log; in-memory structures are replayed on startup.
 
 ## Status
 
-v1 — specification in [VOID.md](./VOID.md). Implementation in progress.
+Live at [0xff.wtf](https://0xff.wtf). Persistence layer (Neon/SQLx) in progress.
+See [paid-vs-free.md](./paid-vs-free.md) for tier details.

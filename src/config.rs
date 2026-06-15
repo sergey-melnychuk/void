@@ -24,10 +24,18 @@ pub struct Config {
     pub max_message_length: usize,
 
     pub ttl_sweep_interval_seconds: u64,
+
+    pub room_creation_limit: usize, // max rooms per IP per window
+    pub room_creation_window_seconds: u64, // sliding window duration
+
+    pub database_url: Option<String>,
 }
 
 fn var<T: std::str::FromStr>(key: &str, default: T) -> T {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 impl Config {
@@ -51,17 +59,26 @@ impl Config {
             max_message_length: var("MAX_MESSAGE_LENGTH", 500),
 
             ttl_sweep_interval_seconds: var("TTL_SWEEP_INTERVAL_SECONDS", 60),
+
+            room_creation_limit: var("ROOM_CREATION_LIMIT", 10),
+            room_creation_window_seconds: var("ROOM_CREATION_WINDOW_SECONDS", 3600),
+
+            database_url: env::var("DATABASE_URL").ok(),
         }
     }
 
     /// Clamp a requested TTL (seconds) into `[1, max_ttl_seconds]`, defaulting
     /// when not provided.
     pub fn clamp_ttl(&self, requested: Option<u64>) -> u64 {
-        requested.unwrap_or(self.default_ttl_seconds).clamp(1, self.max_ttl_seconds)
+        requested
+            .unwrap_or(self.default_ttl_seconds)
+            .clamp(1, self.max_ttl_seconds)
     }
 
     pub fn clamp_max_messages(&self, requested: Option<usize>) -> usize {
-        requested.unwrap_or(self.default_max_messages).clamp(1, self.max_messages_per_room)
+        requested
+            .unwrap_or(self.default_max_messages)
+            .clamp(1, self.max_messages_per_room)
     }
 
     pub fn clamp_max_participants(&self, requested: Option<usize>) -> usize {
@@ -73,6 +90,8 @@ impl Config {
     /// Clamp the per-message rate limit (seconds). Upper-bounded so the
     /// downstream `* 1000` conversion to milliseconds can never overflow.
     pub fn clamp_rate_limit(&self, requested: Option<u64>) -> u64 {
-        requested.unwrap_or(self.default_rate_limit_seconds).min(3600)
+        requested
+            .unwrap_or(self.default_rate_limit_seconds)
+            .min(3600)
     }
 }

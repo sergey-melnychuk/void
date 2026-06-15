@@ -236,6 +236,14 @@ button.lock-btn { color: var(--accent); border-color: var(--accent); }
 }
 
 /* ── Display view: persistent QR widget ─────────────────── */
+.poll-rotate-hint {
+  font-family: var(--mono);
+  font-size: .75rem;
+  color: var(--text-dim);
+  text-align: right;
+  margin-bottom: .5rem;
+}
+
 .display-qr-widget {
   position: fixed;
   bottom: 0;

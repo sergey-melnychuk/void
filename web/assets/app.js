@@ -5,7 +5,7 @@
 // It is carried to the server in the WebSocket subprotocol and an
 // Authorization header — never in a URL — so it stays out of access logs.
 
-import { createApp, reactive, computed, onMounted, nextTick, watch } from 'vue'
+import { createApp, reactive, computed, ref, onMounted, nextTick, watch } from 'vue'
 import QRCode from 'qrcode'
 
 // ── Reactive room store (mirrors VOID.md store shape) ─────────────────────
@@ -30,6 +30,7 @@ const REACTIONS = ['👍', '❤️', '😂', '🔥', '🤔']
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 const sessionKey = (id) => `void_sess_${id}`
+const displayKey = (id) => `void_disp_${id}`
 
 /** Derive the admin token: HMAC-SHA256(secret, room_id) as lowercase hex. */
 async function deriveAdminToken(secret, roomId) {
@@ -218,6 +219,9 @@ let draftRef = null
 // ── Root component ─────────────────────────────────────────────────────────
 const App = {
   setup() {
+    const msgBody = ref(null)
+    const displayPollIdx = ref(0)
+
     const form = reactive({ ttlHours: 2, title: '', password: '', maxParticipants: 100, maxMessages: 200, rateLimit: 3, moderated: false })
     const created = reactive({ publicUrl: '', adminUrl: '', roomId: '', secret: '' })
     const joinForm = reactive({ password: '' })
@@ -285,7 +289,7 @@ const App = {
     // ── enter (display) ────────────────────────────────────────────────────
     async function enterAsDisplay(roomId) {
       room.id = roomId
-      const session = localStorage.getItem(sessionKey(roomId))
+      const session = localStorage.getItem(displayKey(roomId))
       const res = await fetch(`/r/${roomId}/join`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -293,13 +297,16 @@ const App = {
       })
       if (!res.ok) { ui.error = 'Room not found or expired'; ui.view = 'error'; return }
       const data = await res.json()
-      localStorage.setItem(sessionKey(roomId), data.session_token)
+      localStorage.setItem(displayKey(roomId), data.session_token)
       applySnapshot(data.state)
       ui.isAdmin = false
       ui.isDisplay = true
       ui.view = 'room'
       connect(roomId, data.session_token)
       generateDisplayQR()
+      setInterval(() => {
+        if (room.polls.length > 1) displayPollIdx.value = (displayPollIdx.value + 1) % room.polls.length
+      }, 30000)
       document.addEventListener('keydown', (e) => {
         if (e.key === 'f' || e.key === 'F') {
           if (!document.fullscreenElement) document.documentElement.requestFullscreen()
@@ -404,13 +411,27 @@ const App = {
     const pollTotal = (poll) => poll.options.reduce((n, o) => n + o.votes, 0)
     const pct = (poll, o) => { const t = pollTotal(poll); return t ? Math.round((o.votes / t) * 100) : 0 }
 
+    const displayedPolls = computed(() => {
+      if (!ui.isDisplay || room.polls.length === 0) return [...room.polls].reverse()
+      return [room.polls[displayPollIdx.value % room.polls.length]]
+    })
+
+    watch(() => room.messages.length, (cur, prev) => {
+      nextTick(() => {
+        if (!msgBody.value) return
+        const el = msgBody.value
+        const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120
+        if (nearBottom || cur - prev > 1) el.scrollTop = el.scrollHeight
+      })
+    })
+
     return {
       room, ui, myPending, myVotes, form, created, joinForm, draft, pollForm, REACTIONS, location,
       createRoom, enterRoom, enterAsUser, sendMessage, react, submitQuestion,
       voteQuestion, votePoll, toggleLock, lockTimed, deleteMessage, pinQuestion,
       dismissQuestion, answerQuestion, addPollOption, removePollOption, createPoll, closePoll, deletePoll, closeRoom,
       approveMessage, rejectMessage, approveQuestion, rejectQuestion, showQR, hideQR, showDisplay, setDisplayMode,
-      sortedQuestions, pollTotal, pct,
+      sortedQuestions, pollTotal, pct, displayedPolls, displayPollIdx, msgBody,
     }
   },
 
@@ -505,7 +526,7 @@ const App = {
     <!-- Messages -->
     <section class="panel" :class="{'hidden-mobile': ui.tab!=='chat'}">
       <h2>Messages <span v-if="room.messages.length" class="panel-count">{{ room.messages.length }}</span></h2>
-      <div class="panel-body">
+      <div class="panel-body" ref="msgBody">
         <div v-if="ui.isAdmin && !ui.isDisplay && room.pendingMessages.length" class="pending-queue">
           <div class="pending-label">Pending approval</div>
           <div v-for="m in room.pendingMessages" :key="m.id" class="msg pending-item">
@@ -561,8 +582,8 @@ const App = {
           </div>
         </div>
         <div v-for="q in sortedQuestions" :key="q.id" class="msg" :class="{'question-answered': q.answered}">
-          <button v-if="!ui.isDisplay" class="ghost" :class="{'voted-btn': myVotes.has(q.id)}" style="padding:0 .4rem" :disabled="q.answered || (room.locked && !ui.isAdmin)" @click="voteQuestion(q.id)">▲ {{ q.votes }}</button>
-          <span v-else style="color:var(--text-dim);font-size:.85rem;padding:0 .3rem">▲ {{ q.votes }}</span>
+          <button v-if="!ui.isDisplay" class="ghost" :class="{'voted-btn': myVotes.has(q.id)}" style="padding:0 .4rem;margin-right:.4rem" :disabled="q.answered || (room.locked && !ui.isAdmin)" @click="voteQuestion(q.id)">▲ {{ q.votes }}</button>
+          <span v-else style="color:var(--text-dim);font-size:.85rem;padding:0 .3rem;margin-right:.4rem">▲ {{ q.votes }}</span>
           <span v-if="q.pinned" style="color:var(--accent)">📌 </span>{{ q.text }}
           <template v-if="ui.isAdmin && !ui.isDisplay">
             <button v-if="!q.answered" class="ghost" style="padding:0 .3rem;font-size:.7rem" @click="answerQuestion(q.id)">✓</button>
@@ -588,7 +609,10 @@ const App = {
     <section class="panel" :class="{'hidden-mobile': ui.tab!=='polls'}">
       <h2>Polls <span v-if="room.polls.length" class="panel-count">{{ room.polls.length }}</span></h2>
       <div class="panel-body">
-        <div v-for="p in [...room.polls].reverse()" :key="p.id" class="msg">
+        <div v-if="ui.isDisplay && room.polls.length > 1" class="poll-rotate-hint">
+          {{ (displayPollIdx % room.polls.length) + 1 }} / {{ room.polls.length }}
+        </div>
+        <div v-for="p in displayedPolls" :key="p.id" class="msg">
           <strong>{{ p.question }}</strong>
           <span v-if="p.closed" style="color:var(--text-dim)"> · closed</span>
           <div v-for="(o, i) in p.options" :key="i" style="margin:.3rem 0">

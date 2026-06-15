@@ -3,6 +3,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod db;
 pub mod handlers;
 pub mod state;
 pub mod ws;
@@ -60,7 +61,11 @@ fn serve_embedded(path: &str) -> Response {
     match Web::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
-            ([(header::CONTENT_TYPE, mime.as_ref())], content.data.into_owned()).into_response()
+            (
+                [(header::CONTENT_TYPE, mime.as_ref())],
+                content.data.into_owned(),
+            )
+                .into_response()
         }
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }

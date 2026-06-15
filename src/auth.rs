@@ -41,8 +41,8 @@ pub fn new_session_token() -> String {
 
 /// Derive the admin token: `HMAC-SHA256(secret, room_id)` as lowercase hex.
 pub fn admin_token(secret: &str, room_id: &str) -> String {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC accepts keys of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any size");
     mac.update(room_id.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }

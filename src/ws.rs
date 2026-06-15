@@ -24,10 +24,23 @@ use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
 
-use crate::auth;
+use crate::db;
 use crate::state::{AppState, Message, Poll, PollOption, Question, Room, now_ms};
 
 const REACTIONS: [&str; 5] = ["👍", "❤️", "😂", "🔥", "🤔"];
+
+/// Fire-and-forget DB event append. Skips the test room and no-DB configs.
+fn persist(app: &Arc<AppState>, room_id: &str, kind: &'static str, payload: Value) {
+    if room_id == "test" {
+        return;
+    }
+    let Some(pool) = app.db.as_ref() else { return };
+    let pool = pool.clone();
+    let room_id = room_id.to_string();
+    tokio::spawn(async move {
+        db::append_event(&pool, &room_id, kind, payload).await;
+    });
+}
 /// Subprotocol prefix carrying the auth token, e.g. `void.token.<token>`.
 const TOKEN_PROTO_PREFIX: &str = "void.token.";
 
@@ -59,7 +72,7 @@ pub async fn ws_handler(
     // are gated on `is_admin`, not on the identity string.
     let is_display = !is_admin && token.starts_with("disp.");
     let identity = if is_admin {
-        format!("admin:{}", auth::new_session_token())
+        format!("admin:{}", room.secret)
     } else {
         token
     };
@@ -75,9 +88,10 @@ pub async fn ws_handler(
 /// Extract `(full_protocol, token)` from the `Sec-WebSocket-Protocol` header.
 fn token_protocol(headers: &HeaderMap) -> Option<(String, String)> {
     let raw = headers.get(header::SEC_WEBSOCKET_PROTOCOL)?.to_str().ok()?;
-    raw.split(',')
-        .map(str::trim)
-        .find_map(|p| p.strip_prefix(TOKEN_PROTO_PREFIX).map(|t| (p.to_string(), t.to_string())))
+    raw.split(',').map(str::trim).find_map(|p| {
+        p.strip_prefix(TOKEN_PROTO_PREFIX)
+            .map(|t| (p.to_string(), t.to_string()))
+    })
 }
 
 async fn handle_socket(
@@ -102,7 +116,10 @@ async fn handle_socket(
             }
             inner.participants += 1;
         }
-        (inner.snapshot_for(&room.id, is_admin, room.title.as_deref()), inner.participants)
+        (
+            inner.snapshot_for(&room.id, is_admin, room.title.as_deref()),
+            inner.participants,
+        )
     };
 
     let (mut sink, mut stream) = socket.split();
@@ -111,10 +128,14 @@ async fn handle_socket(
     // starts — so no live event can ever be delivered ahead of it.
     let first = json!({ "type": "snapshot", "payload": snapshot }).to_string();
     if sink.send(WsMessage::Text(first.into())).await.is_err() {
-        if !is_display { leave(&room); }
+        if !is_display {
+            leave(&room);
+        }
         return;
     }
-    if !is_display { broadcast_participants(&room, count); }
+    if !is_display {
+        broadcast_participants(&room, count);
+    }
 
     let (ptx, mut prx) = mpsc::unbounded_channel::<String>();
 
@@ -125,7 +146,9 @@ async fn handle_socket(
         let ptx2 = ptx.clone();
         tokio::spawn(async move {
             while let Ok(msg) = admin_rx.recv().await {
-                if ptx2.send(msg).is_err() { break }
+                if ptx2.send(msg).is_err() {
+                    break;
+                }
             }
         });
     }
@@ -163,14 +186,24 @@ async fn handle_socket(
     // Inbound loop.
     while let Some(Ok(msg)) = stream.next().await {
         match msg {
-            WsMessage::Text(t) => handle_client(&app, &room, &identity, is_admin, is_display, t.as_str(), &ptx),
+            WsMessage::Text(t) => handle_client(
+                &app,
+                &room,
+                &identity,
+                is_admin,
+                is_display,
+                t.as_str(),
+                &ptx,
+            ),
             WsMessage::Close(_) => break,
             _ => {}
         }
     }
 
     send_task.abort();
-    if !is_display { leave(&room); }
+    if !is_display {
+        leave(&room);
+    }
 }
 
 /// Decrement the participant count and announce the new total.
@@ -193,7 +226,11 @@ fn personal_err(ptx: &mpsc::UnboundedSender<String>, code: &str, message: &str) 
 }
 
 fn role_str(is_admin: bool) -> String {
-    if is_admin { "admin".into() } else { "user".into() }
+    if is_admin {
+        "admin".into()
+    } else {
+        "user".into()
+    }
 }
 
 /// Dispatch one inbound client message. Synchronous: it only mutates room
@@ -214,7 +251,9 @@ fn handle_client(
     let p = v.get("payload").cloned().unwrap_or_else(|| json!({}));
 
     // Display connections are read-only — silently drop all input.
-    if is_display { return; }
+    if is_display {
+        return;
+    }
 
     // Admin-only actions gate up front.
     if kind.starts_with("admin_") && !is_admin {
@@ -224,7 +263,12 @@ fn handle_client(
     match kind {
         // ── user actions ────────────────────────────────────────────────
         "message" => {
-            let text = p.get("text").and_then(Value::as_str).unwrap_or("").trim().to_string();
+            let text = p
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if text.is_empty() {
                 return;
             }
@@ -238,11 +282,10 @@ fn handle_client(
                     return personal_err(ptx, "too_long", "message exceeds max length");
                 }
                 if !is_admin {
-                    if let Some(&last) = inner.last_message_at.get(identity) {
-                        if now.saturating_sub(last) < room.cfg.rate_limit_ms {
+                    if let Some(&last) = inner.last_message_at.get(identity)
+                        && now.saturating_sub(last) < room.cfg.rate_limit_ms {
                             return personal_err(ptx, "rate_limited", "slow down");
                         }
-                    }
                     inner.last_message_at.insert(identity.to_string(), now);
                 }
                 let id = inner.next_msg_id();
@@ -258,7 +301,7 @@ fn handle_client(
                     drop(inner);
                     let ev = json!({ "type": "pending_message", "payload": msg });
                     let _ = ptx.send(ev.to_string()); // submitter sees their own pending item
-                    room.broadcast_admin(ev);          // admins see it in their queue
+                    room.broadcast_admin(ev); // admins see it in their queue
                     return;
                 }
                 inner.messages.push_back(msg.clone());
@@ -267,6 +310,14 @@ fn handle_client(
                 }
                 json!({ "type": "message", "payload": msg })
             };
+            if let Some(p) = event.get("payload") {
+                persist(
+                    app,
+                    &room.id,
+                    "message",
+                    json!({"id": p["id"], "role": p["role"], "text": p["text"], "ts": p["ts"]}),
+                );
+            }
             room.broadcast(event);
         }
 
@@ -280,17 +331,23 @@ fn handle_client(
             if !REACTIONS.contains(&emoji.as_str()) {
                 return personal_err(ptx, "bad_emoji", "unsupported reaction");
             }
-            let event = {
+            let (event, added) = {
                 let mut inner = room.inner.lock().unwrap();
                 // Confirm the message still exists BEFORE touching dedup state,
                 // so a reaction racing a delete leaves no orphaned entry.
                 if !inner.messages.iter().any(|m| m.id == mid) {
                     return;
                 }
-                let users = inner.reaction_users.entry((mid, emoji.clone())).or_default();
-                if !users.remove(identity) {
+                let users = inner
+                    .reaction_users
+                    .entry((mid, emoji.clone()))
+                    .or_default();
+                let added = if !users.remove(identity) {
                     users.insert(identity.to_string());
-                }
+                    true
+                } else {
+                    false
+                };
                 let count = users.len() as u32;
                 if count == 0 {
                     inner.reaction_users.remove(&(mid, emoji.clone())); // don't leak empty sets
@@ -301,13 +358,32 @@ fn handle_client(
                 } else {
                     msg.reactions.insert(emoji.clone(), count);
                 }
-                json!({ "type": "reaction", "payload": { "message_id": mid, "emoji": emoji, "count": count } })
+                (
+                    json!({ "type": "reaction", "payload": { "message_id": mid, "emoji": emoji, "count": count } }),
+                    added,
+                )
             };
+            let kind = if added {
+                "reaction_add"
+            } else {
+                "reaction_remove"
+            };
+            persist(
+                app,
+                &room.id,
+                kind,
+                json!({"message_id": mid, "emoji": emoji, "voter": identity}),
+            );
             room.broadcast(event);
         }
 
         "question" => {
-            let text = p.get("text").and_then(Value::as_str).unwrap_or("").trim().to_string();
+            let text = p
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if text.is_empty() {
                 return;
             }
@@ -320,7 +396,13 @@ fn handle_client(
                     return personal_err(ptx, "locked", "room is locked");
                 }
                 let id = inner.next_question_id();
-                let q = Question { id, text, votes: 0, pinned: false, answered: false };
+                let q = Question {
+                    id,
+                    text,
+                    votes: 0,
+                    pinned: false,
+                    answered: false,
+                };
                 if room.cfg.moderated && !is_admin {
                     inner.pending_questions.push(q.clone());
                     drop(inner);
@@ -332,35 +414,65 @@ fn handle_client(
                 inner.questions.push(q.clone());
                 json!({ "type": "question", "payload": q })
             };
+            if let Some(p) = event.get("payload") {
+                persist(
+                    app,
+                    &room.id,
+                    "question",
+                    json!({"id": p["id"], "text": p["text"]}),
+                );
+            }
             room.broadcast(event);
         }
 
         "vote" => {
-            let Some(qid) = p.get("question_id").and_then(Value::as_u64) else { return };
-            let event = {
+            let Some(qid) = p.get("question_id").and_then(Value::as_u64) else {
+                return;
+            };
+            let (event, removed) = {
                 let mut inner = room.inner.lock().unwrap();
                 if inner.effective_locked() && !is_admin {
                     return personal_err(ptx, "locked", "room is locked");
                 }
                 match inner.questions.iter().find(|q| q.id == qid) {
                     None => return,
-                    Some(q) if q.answered => return personal_err(ptx, "answered", "question already answered"),
+                    Some(q) if q.answered => {
+                        return personal_err(ptx, "answered", "question already answered");
+                    }
                     _ => {}
                 }
                 let voters = inner.question_voters.entry(qid).or_default();
                 let already = !voters.insert(identity.to_string());
-                if already { voters.remove(identity); }
+                if already {
+                    voters.remove(identity);
+                }
                 let q = inner.questions.iter_mut().find(|q| q.id == qid).unwrap();
-                if already { q.votes = q.votes.saturating_sub(1); } else { q.votes += 1; }
-                json!({ "type": "vote", "payload": { "question_id": qid, "votes": q.votes } })
+                if already {
+                    q.votes = q.votes.saturating_sub(1);
+                } else {
+                    q.votes += 1;
+                }
+                (
+                    json!({ "type": "vote", "payload": { "question_id": qid, "votes": q.votes } }),
+                    already,
+                )
             };
+            let kind = if removed { "vote_remove" } else { "vote_add" };
+            persist(
+                app,
+                &room.id,
+                kind,
+                json!({"question_id": qid, "voter": identity}),
+            );
             room.broadcast(event);
         }
 
         "poll_vote" => {
             let (Some(pid), Some(idx)) = (
                 p.get("poll_id").and_then(Value::as_u64),
-                p.get("option_index").and_then(Value::as_u64).map(|i| i as usize),
+                p.get("option_index")
+                    .and_then(Value::as_u64)
+                    .map(|i| i as usize),
             ) else {
                 return;
             };
@@ -369,8 +481,11 @@ fn handle_client(
                 if inner.effective_locked() && !is_admin {
                     return personal_err(ptx, "locked", "room is locked");
                 }
-                let Some((closed, n_opts)) =
-                    inner.polls.iter().find(|p| p.id == pid).map(|p| (p.closed, p.options.len()))
+                let Some((closed, n_opts)) = inner
+                    .polls
+                    .iter()
+                    .find(|p| p.id == pid)
+                    .map(|p| (p.closed, p.options.len()))
                 else {
                     return;
                 };
@@ -393,54 +508,106 @@ fn handle_client(
                     .collect();
                 json!({ "type": "poll_update", "payload": { "poll_id": pid, "options": options } })
             };
+            persist(
+                app,
+                &room.id,
+                "poll_vote",
+                json!({"poll_id": pid, "option_index": idx, "voter": identity}),
+            );
             room.broadcast(event);
         }
 
         // ── admin actions ───────────────────────────────────────────────
         "admin_approve_message" => {
-            let Some(mid) = p.get("message_id").and_then(Value::as_u64) else { return };
+            let Some(mid) = p.get("message_id").and_then(Value::as_u64) else {
+                return;
+            };
             let event = {
                 let mut inner = room.inner.lock().unwrap();
-                let Some(pos) = inner.pending_messages.iter().position(|m| m.id == mid) else { return };
+                let Some(pos) = inner.pending_messages.iter().position(|m| m.id == mid) else {
+                    return;
+                };
                 let msg = inner.pending_messages.remove(pos);
                 inner.messages.push_back(msg.clone());
-                while inner.messages.len() > room.cfg.max_messages { inner.messages.pop_front(); }
+                while inner.messages.len() > room.cfg.max_messages {
+                    inner.messages.pop_front();
+                }
                 json!({ "type": "message", "payload": msg })
             };
+            if let Some(p) = event.get("payload") {
+                persist(
+                    app,
+                    &room.id,
+                    "message",
+                    json!({"id": p["id"], "role": p["role"], "text": p["text"], "ts": p["ts"]}),
+                );
+            }
             room.broadcast(event);
         }
 
         "admin_reject_message" => {
-            let Some(mid) = p.get("message_id").and_then(Value::as_u64) else { return };
-            room.inner.lock().unwrap().pending_messages.retain(|m| m.id != mid);
+            let Some(mid) = p.get("message_id").and_then(Value::as_u64) else {
+                return;
+            };
+            room.inner
+                .lock()
+                .unwrap()
+                .pending_messages
+                .retain(|m| m.id != mid);
             room.broadcast(json!({ "type": "pending_message_rejected", "payload": { "id": mid } }));
         }
 
         "admin_approve_question" => {
-            let Some(qid) = p.get("question_id").and_then(Value::as_u64) else { return };
+            let Some(qid) = p.get("question_id").and_then(Value::as_u64) else {
+                return;
+            };
             let event = {
                 let mut inner = room.inner.lock().unwrap();
-                let Some(pos) = inner.pending_questions.iter().position(|q| q.id == qid) else { return };
+                let Some(pos) = inner.pending_questions.iter().position(|q| q.id == qid) else {
+                    return;
+                };
                 let q = inner.pending_questions.remove(pos);
                 inner.questions.push(q.clone());
                 json!({ "type": "question", "payload": q })
             };
+            if let Some(p) = event.get("payload") {
+                persist(
+                    app,
+                    &room.id,
+                    "question",
+                    json!({"id": p["id"], "text": p["text"]}),
+                );
+            }
             room.broadcast(event);
         }
 
         "admin_reject_question" => {
-            let Some(qid) = p.get("question_id").and_then(Value::as_u64) else { return };
-            room.inner.lock().unwrap().pending_questions.retain(|q| q.id != qid);
-            room.broadcast(json!({ "type": "pending_question_rejected", "payload": { "id": qid } }));
+            let Some(qid) = p.get("question_id").and_then(Value::as_u64) else {
+                return;
+            };
+            room.inner
+                .lock()
+                .unwrap()
+                .pending_questions
+                .retain(|q| q.id != qid);
+            room.broadcast(
+                json!({ "type": "pending_question_rejected", "payload": { "id": qid } }),
+            );
         }
 
         "admin_lock" => {
             let locked = p.get("locked").and_then(Value::as_bool).unwrap_or(false);
             // Clamp the duration so the deadline math can't overflow and a
             // timed lock can't be scheduled absurdly far out.
-            let dur = p.get("duration_seconds").and_then(Value::as_u64).map(|d| d.min(86_400));
-            let until =
-                if locked { dur.map(|d| now_ms().saturating_add(d.saturating_mul(1000))) } else { None };
+            let dur = p
+                .get("duration_seconds")
+                .and_then(Value::as_u64)
+                .map(|d| d.min(86_400));
+            let until = if locked {
+                dur.map(|d| now_ms().saturating_add(d.saturating_mul(1000)))
+            } else {
+                None
+            };
 
             let epoch = {
                 let mut inner = room.inner.lock().unwrap();
@@ -449,7 +616,15 @@ fn handle_client(
                 inner.lock_epoch += 1;
                 inner.lock_epoch
             };
-            room.broadcast(json!({ "type": "lock", "payload": { "locked": locked, "until": until } }));
+            persist(
+                app,
+                &room.id,
+                "lock",
+                json!({"locked": locked, "until": until}),
+            );
+            room.broadcast(
+                json!({ "type": "lock", "payload": { "locked": locked, "until": until } }),
+            );
 
             // Schedule automatic unlock; it fires only if the lock epoch is
             // still the one we set (so a later manual lock/unlock wins). Holds
@@ -475,47 +650,88 @@ fn handle_client(
         }
 
         "admin_delete_message" => {
-            let Some(mid) = p.get("message_id").and_then(Value::as_u64) else { return };
-            room.update(|inner| {
+            let Some(mid) = p.get("message_id").and_then(Value::as_u64) else {
+                return;
+            };
+            {
+                let mut inner = room.inner.lock().unwrap();
                 inner.messages.retain(|m| m.id != mid);
                 inner.reaction_users.retain(|(id, _), _| *id != mid);
-                Some(json!({ "type": "message_deleted", "payload": { "id": mid } }))
-            });
+            }
+            persist(app, &room.id, "message_deleted", json!({"id": mid}));
+            room.broadcast(json!({ "type": "message_deleted", "payload": { "id": mid } }));
         }
 
         "admin_pin_question" => {
-            let Some(qid) = p.get("question_id").and_then(Value::as_u64) else { return };
-            room.update(|inner| {
+            let Some(qid) = p.get("question_id").and_then(Value::as_u64) else {
+                return;
+            };
+            let pinned = {
+                let mut inner = room.inner.lock().unwrap();
                 let already = inner.questions.iter().any(|q| q.id == qid && q.pinned);
                 for q in inner.questions.iter_mut() {
                     q.pinned = if already { false } else { q.id == qid };
                 }
-                Some(json!({ "type": "question_pinned", "payload": { "question_id": qid, "pinned": !already } }))
-            });
+                !already
+            };
+            persist(
+                app,
+                &room.id,
+                "question_pinned",
+                json!({"question_id": qid, "pinned": pinned}),
+            );
+            room.broadcast(json!({ "type": "question_pinned", "payload": { "question_id": qid, "pinned": pinned } }));
         }
 
         "admin_answer_question" => {
-            let Some(qid) = p.get("question_id").and_then(Value::as_u64) else { return };
-            room.update(|inner| {
+            let Some(qid) = p.get("question_id").and_then(Value::as_u64) else {
+                return;
+            };
+            {
+                let mut inner = room.inner.lock().unwrap();
                 if let Some(q) = inner.questions.iter_mut().find(|q| q.id == qid) {
                     q.answered = true;
                     q.pinned = false;
                 }
-                Some(json!({ "type": "question_answered", "payload": { "question_id": qid } }))
-            });
+            }
+            persist(
+                app,
+                &room.id,
+                "question_answered",
+                json!({"question_id": qid}),
+            );
+            room.broadcast(
+                json!({ "type": "question_answered", "payload": { "question_id": qid } }),
+            );
         }
 
         "admin_dismiss_question" => {
-            let Some(qid) = p.get("question_id").and_then(Value::as_u64) else { return };
-            room.update(|inner| {
+            let Some(qid) = p.get("question_id").and_then(Value::as_u64) else {
+                return;
+            };
+            {
+                let mut inner = room.inner.lock().unwrap();
                 inner.questions.retain(|q| q.id != qid);
                 inner.question_voters.remove(&qid);
-                Some(json!({ "type": "question_dismissed", "payload": { "question_id": qid } }))
-            });
+            }
+            persist(
+                app,
+                &room.id,
+                "question_dismissed",
+                json!({"question_id": qid}),
+            );
+            room.broadcast(
+                json!({ "type": "question_dismissed", "payload": { "question_id": qid } }),
+            );
         }
 
         "admin_create_poll" => {
-            let question = p.get("question").and_then(Value::as_str).unwrap_or("").trim().to_string();
+            let question = p
+                .get("question")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
             let options: Vec<String> = p
                 .get("options")
                 .and_then(Value::as_array)
@@ -530,47 +746,74 @@ fn handle_client(
             if question.is_empty() || !(2..=6).contains(&options.len()) {
                 return personal_err(ptx, "bad_poll", "need a question and 2–6 options");
             }
-            room.update(|inner| {
+            let poll = {
+                let mut inner = room.inner.lock().unwrap();
                 let id = inner.next_poll_id();
                 let poll = Poll {
                     id,
                     question,
-                    options: options.into_iter().map(|text| PollOption { text, votes: 0 }).collect(),
+                    options: options
+                        .into_iter()
+                        .map(|text| PollOption { text, votes: 0 })
+                        .collect(),
                     closed: false,
                 };
                 inner.polls.push(poll.clone());
-                Some(json!({ "type": "poll_created", "payload": poll }))
-            });
+                poll
+            };
+            persist(
+                app,
+                &room.id,
+                "poll_created",
+                json!({"id": poll.id, "question": poll.question,
+                       "options": poll.options.iter().map(|o| json!({"text": o.text})).collect::<Vec<_>>()}),
+            );
+            room.broadcast(json!({ "type": "poll_created", "payload": poll }));
         }
 
         "admin_close_poll" => {
-            let Some(pid) = p.get("poll_id").and_then(Value::as_u64) else { return };
-            room.update(|inner| {
+            let Some(pid) = p.get("poll_id").and_then(Value::as_u64) else {
+                return;
+            };
+            {
+                let mut inner = room.inner.lock().unwrap();
                 if let Some(poll) = inner.polls.iter_mut().find(|p| p.id == pid) {
                     poll.closed = true;
                 }
-                Some(json!({ "type": "poll_closed", "payload": { "poll_id": pid } }))
-            });
+            }
+            persist(app, &room.id, "poll_closed", json!({"poll_id": pid}));
+            room.broadcast(json!({ "type": "poll_closed", "payload": { "poll_id": pid } }));
         }
 
         "admin_delete_poll" => {
-            let Some(pid) = p.get("poll_id").and_then(Value::as_u64) else { return };
-            room.update(|inner| {
+            let Some(pid) = p.get("poll_id").and_then(Value::as_u64) else {
+                return;
+            };
+            {
+                let mut inner = room.inner.lock().unwrap();
                 inner.polls.retain(|p| p.id != pid);
                 inner.poll_voters.remove(&pid);
-                Some(json!({ "type": "poll_deleted", "payload": { "poll_id": pid } }))
-            });
+            }
+            persist(app, &room.id, "poll_deleted", json!({"poll_id": pid}));
+            room.broadcast(json!({ "type": "poll_deleted", "payload": { "poll_id": pid } }));
         }
 
         "admin_display_mode" => {
             let mode = p.get("mode").and_then(Value::as_str).unwrap_or("questions");
-            if !["questions", "messages", "polls", "qr"].contains(&mode) { return }
+            if !["questions", "messages", "polls", "qr"].contains(&mode) {
+                return;
+            }
             room.broadcast(json!({ "type": "display_mode", "payload": { "mode": mode } }));
         }
 
         "admin_close_room" => {
             room.broadcast(json!({ "type": "room_closed", "payload": {} }));
             app.rooms.remove(&room.id);
+            if let Some(pool) = app.db.as_ref() {
+                let pool = pool.clone();
+                let room_id = room.id.clone();
+                tokio::spawn(async move { db::delete_room(&pool, &room_id).await });
+            }
         }
 
         _ => personal_err(ptx, "unknown", "unknown message type"),

@@ -400,7 +400,131 @@ CMD ["void"]
 
 ---
 
+## Persistence
+
+### Goals
+
+All room state survives server restarts within the room's TTL. Free and paid rooms
+are treated identically — persistence is not a differentiator; longevity and custom
+URLs are.
+
+### Architecture
+
+**Postgres (Neon)** + **SQLx**. Two tables only.
+
+```sql
+-- Room metadata: fast lookup without replaying events.
+CREATE TABLE rooms (
+  id                 TEXT PRIMARY KEY,
+  title              TEXT,
+  secret             TEXT NOT NULL,
+  password_hash      TEXT,
+  expires_at         BIGINT NOT NULL,   -- epoch ms
+  created_at         BIGINT NOT NULL,
+  max_messages       INT NOT NULL,
+  max_participants   INT NOT NULL,
+  rate_limit_ms      BIGINT NOT NULL,
+  max_message_length INT NOT NULL,
+  moderated          BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+-- Append-only event log: one row per state-changing action.
+CREATE TABLE events (
+  seq      BIGSERIAL,
+  room_id  TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+  type     TEXT NOT NULL,
+  payload  JSONB NOT NULL,
+  ts       BIGINT NOT NULL   -- epoch ms
+);
+
+CREATE INDEX ON events (room_id, seq);   -- fast ordered replay per room
+CREATE INDEX ON rooms (expires_at);      -- fast TTL sweep
+```
+
+### Event types
+
+Storage payloads carry more data than broadcast payloads (e.g. `identity` for
+dedup replay) but are never sent to clients.
+
+| type | payload |
+|---|---|
+| `session_joined` | `{ token }` |
+| `message_posted` | `{ id, role, text, ts, identity }` |
+| `message_deleted` | `{ message_id }` |
+| `reaction_toggled` | `{ message_id, emoji, identity }` |
+| `pending_msg_posted` | `{ id, role, text, ts, identity }` |
+| `pending_msg_approved` | `{ message_id }` |
+| `pending_msg_rejected` | `{ message_id }` |
+| `question_posted` | `{ id, text }` |
+| `question_voted` | `{ question_id, identity }` |
+| `question_pinned` | `{ question_id, pinned }` |
+| `question_answered` | `{ question_id }` |
+| `question_dismissed` | `{ question_id }` |
+| `pending_q_posted` | `{ id, text }` |
+| `pending_q_approved` | `{ question_id }` |
+| `pending_q_rejected` | `{ question_id }` |
+| `poll_created` | `{ id, question, options: [text] }` |
+| `poll_voted` | `{ poll_id, option_idx, identity }` |
+| `poll_closed` | `{ poll_id }` |
+| `poll_deleted` | `{ poll_id }` |
+| `room_lock_changed` | `{ locked }` |
+
+No `room_created` event — the `rooms` row is the source of truth for metadata.
+No `room_closed` event — `DELETE FROM rooms` cascades to events.
+
+### Write strategy
+
+The DB is **never in the broadcast hot path**:
+
+1. Mutate in-memory state
+2. Broadcast to WebSocket subscribers
+3. Fire async DB write (no await before broadcast)
+
+Clients never wait on Postgres. A crash between steps 2 and 3 loses at most the
+last in-flight event — acceptable for a conference room tool.
+
+Rate limiting state (`last_message_at`) is intentionally not persisted; it resets
+on restart.
+
+### Startup replay
+
+```
+SELECT * FROM rooms WHERE expires_at > now_ms();
+```
+
+For each room, replay its events in `seq` order to reconstruct the full
+`RoomInner`: messages (with reactions), questions (votes, voter sets, pinned,
+answered), polls (options, votes, voter sets), pending queues, sessions, lock
+state.
+
+`next_msg_id`, `next_question_id`, `next_poll_id` are derived from the max IDs
+seen during replay.
+
+Lock state: `effective_locked()` already checks `locked_until` against wall clock,
+so a timed lock whose deadline passed during downtime auto-expires on first access.
+
+### TTL sweep
+
+```sql
+DELETE FROM rooms WHERE expires_at < $1;
+```
+
+`ON DELETE CASCADE` removes all events for expired rooms. Sweep runs on the same
+interval as the in-memory reap (`TTL_SWEEP_INTERVAL_SECONDS`).
+
+### Scalability notes
+
+The `(room_id, seq)` index makes replay queries touch only that room's rows —
+functionally equivalent to table-per-room for read performance. At conference room
+scale (thousands of rooms, hundreds of events each) Postgres handles this without
+issue. Partitioning by time range is available if the table grows into the hundreds
+of millions of rows.
+
 ## Future Work
 
-- **Multi-instance scaling** — consistent-hashing partitions rooms across instances; each room lives entirely on one node; no cross-instance state sharing needed; out of scope for v1
-- **Persistence** — optional append-only log per room for crash recovery; out of scope for v1
+- **Multi-instance scaling** — sticky sessions by room_id; Postgres NOTIFY or
+  Redis pub/sub for cross-instance broadcast
+- **Paid tier** — custom URL slugs, 30-day TTL, unlimited caps, recap export on
+  expiry (JSON / PDF); Stripe + crypto payments
+- **User accounts** — optional persistent identity across rooms (v3)
+- **Mobile app** — React Native (v3)

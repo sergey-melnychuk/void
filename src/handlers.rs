@@ -21,6 +21,20 @@ use serde_json::json;
 use crate::auth;
 use crate::state::{AppState, Room, RoomConfig};
 
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+/// Best-effort client IP: leftmost address in `X-Forwarded-For`, else "unknown".
+/// The leftmost entry is the original client when behind a trusted reverse proxy.
+fn extract_ip(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 // ── POST /rooms ────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Default)]
@@ -36,9 +50,27 @@ pub struct CreateRoomReq {
 
 pub async fn create_room(
     State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: Option<Json<CreateRoomReq>>,
 ) -> Response {
     let req = body.map(|Json(b)| b).unwrap_or_default();
+
+    // Rate limit by IP: max N rooms per sliding window.
+    let ip = extract_ip(&headers);
+    let now = crate::state::now_ms();
+    let window_ms = app.config.room_creation_window_seconds * 1000;
+    {
+        let mut entry = app.creation_limiter.entry(ip).or_default();
+        entry.retain(|&ts| now.saturating_sub(ts) < window_ms);
+        if entry.len() >= app.config.room_creation_limit {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate limited — too many rooms created",
+            )
+                .into_response();
+        }
+        entry.push(now);
+    }
     let cfg = &app.config;
 
     let ttl = cfg.clamp_ttl(req.ttl_seconds);
@@ -67,13 +99,33 @@ pub async fn create_room(
         room_id = auth::new_room_id();
     }
     if app.rooms.contains_key(&room_id) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "could not allocate room id").into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not allocate room id",
+        )
+            .into_response();
     }
 
-    let title = req.title.map(|t| t.trim().chars().take(20).collect::<String>()).filter(|t| !t.is_empty());
+    let title = req
+        .title
+        .map(|t| t.trim().chars().take(20).collect::<String>())
+        .filter(|t| !t.is_empty());
     let secret = auth::new_secret();
-    let room = Room::new(room_id.clone(), title, secret.clone(), password_hash, ttl, room_cfg);
-    app.rooms.insert(room_id.clone(), room);
+    let expires_at = crate::state::now_ms().saturating_add(ttl.saturating_mul(1000));
+    let room = Room::new(
+        room_id.clone(),
+        title,
+        secret.clone(),
+        password_hash,
+        expires_at,
+        room_cfg,
+    );
+    app.rooms.insert(room_id.clone(), room.clone());
+
+    if let Some(pool) = app.db.as_ref() {
+        let pool = pool.clone();
+        tokio::spawn(async move { crate::db::persist_room(&pool, &room).await });
+    }
 
     let base = cfg.base_url.trim_end_matches('/');
     Json(json!({
@@ -116,8 +168,8 @@ pub async fn join_room(
         .map(|s| room.inner.lock().unwrap().sessions.contains(s))
         .unwrap_or(false);
 
-    if !reconnecting {
-        if let Some(hash) = &room.password_hash {
+    if !reconnecting
+        && let Some(hash) = &room.password_hash {
             let ok = req
                 .password
                 .as_deref()
@@ -127,7 +179,6 @@ pub async fn join_room(
                 return (StatusCode::FORBIDDEN, "bad or missing password").into_response();
             }
         }
-    }
 
     // Concurrent room size is capped at the WebSocket layer (live connections);
     // we deliberately do NOT cap the lifetime session set here. Without accounts
@@ -166,7 +217,9 @@ pub async fn room_state(
         return (StatusCode::NOT_FOUND, "room expired").into_response();
     }
 
-    let authorized = bearer(&headers).map(|t| room.is_admin_token(&t)).unwrap_or(false);
+    let authorized = bearer(&headers)
+        .map(|t| room.is_admin_token(&t))
+        .unwrap_or(false);
     if !authorized {
         return (StatusCode::FORBIDDEN, "admin token required").into_response();
     }
@@ -179,14 +232,17 @@ pub async fn room_state(
 fn bearer(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
     let (scheme, token) = raw.split_once(' ')?;
-    scheme.eq_ignore_ascii_case("bearer").then(|| token.trim().to_string())
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| token.trim().to_string())
 }
 
 // ── TTL sweep ────────────────────────────────────────────────────────────────
 
 /// Background task: periodically reap expired rooms so none are orphaned.
 pub async fn sweep_expired(app: Arc<AppState>) {
-    let mut tick = tokio::time::interval(Duration::from_secs(app.config.ttl_sweep_interval_seconds));
+    let mut tick =
+        tokio::time::interval(Duration::from_secs(app.config.ttl_sweep_interval_seconds));
     loop {
         tick.tick().await;
         let expired: Vec<String> = app
@@ -195,10 +251,22 @@ pub async fn sweep_expired(app: Arc<AppState>) {
             .filter(|e| e.value().is_expired())
             .map(|e| e.key().clone())
             .collect();
-        for id in expired {
-            if let Some((_, room)) = app.rooms.remove(&id) {
+        for id in &expired {
+            if let Some((_, room)) = app.rooms.remove(id) {
                 room.broadcast(json!({ "type": "room_closed", "payload": {} }));
             }
         }
+        if let Some(pool) = app.db.as_ref() {
+            let pool = pool.clone();
+            tokio::spawn(async move { crate::db::delete_expired(&pool).await });
+        }
+
+        // Evict IPs with no recent creations to keep the limiter map lean.
+        let window_ms = app.config.room_creation_window_seconds * 1000;
+        let now = crate::state::now_ms();
+        app.creation_limiter.retain(|_, timestamps| {
+            timestamps.retain(|&ts| now.saturating_sub(ts) < window_ms);
+            !timestamps.is_empty()
+        });
     }
 }

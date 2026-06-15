@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use serde::Serialize;
 use serde_json::{Value, json};
+use sqlx::PgPool;
 use tokio::sync::broadcast;
 
 use crate::config::Config;
@@ -18,11 +19,20 @@ pub type Rooms = DashMap<String, Arc<Room>>;
 pub struct AppState {
     pub rooms: Rooms,
     pub config: Config,
+    /// IP address → timestamps (epoch ms) of recent room creations, for rate limiting.
+    pub creation_limiter: DashMap<String, Vec<u64>>,
+    /// Postgres pool. None when DATABASE_URL is not set (pure in-memory mode).
+    pub db: Option<PgPool>,
 }
 
 impl AppState {
-    pub fn new(config: Config) -> Arc<Self> {
-        Arc::new(AppState { rooms: DashMap::new(), config })
+    pub fn new(config: Config, db: Option<PgPool>) -> Arc<Self> {
+        Arc::new(AppState {
+            rooms: DashMap::new(),
+            config,
+            creation_limiter: DashMap::new(),
+            db,
+        })
     }
 }
 
@@ -133,7 +143,7 @@ impl Room {
         title: Option<String>,
         secret: String,
         password_hash: Option<String>,
-        ttl_seconds: u64,
+        expires_at: u64,
         cfg: RoomConfig,
     ) -> Arc<Room> {
         // Generous buffer so a briefly-slow client at the 200-user target does
@@ -145,7 +155,7 @@ impl Room {
             title,
             secret,
             password_hash,
-            expires_at: now_ms().saturating_add(ttl_seconds.saturating_mul(1000)),
+            expires_at,
             cfg,
             tx,
             admin_tx,
@@ -193,7 +203,10 @@ impl Room {
 
     /// Build the admin state snapshot (returned by `GET /r/:id/state`).
     pub fn snapshot(&self) -> Value {
-        self.inner.lock().unwrap().snapshot_for(&self.id, true, self.title.as_deref())
+        self.inner
+            .lock()
+            .unwrap()
+            .snapshot_for(&self.id, true, self.title.as_deref())
     }
 }
 
@@ -201,7 +214,7 @@ impl RoomInner {
     /// Effective lock state: a timed lock whose deadline has passed reads as
     /// unlocked even if the auto-unlock task hasn't fired yet (self-healing).
     pub fn effective_locked(&self) -> bool {
-        self.locked && self.locked_until.map_or(true, |until| now_ms() < until)
+        self.locked && self.locked_until.is_none_or(|until| now_ms() < until)
     }
 
     pub fn snapshot(&self, room_id: &str, title: Option<&str>) -> Value {
@@ -238,5 +251,183 @@ impl RoomInner {
     pub fn next_poll_id(&mut self) -> u64 {
         self.next_poll_id += 1;
         self.next_poll_id
+    }
+
+    /// Apply one persisted event during startup replay. Mirrors the mutations
+    /// in ws.rs::handle_client but without broadcasting or side-effects.
+    pub fn apply_event(&mut self, kind: &str, p: &Value) {
+        match kind {
+            "message" => {
+                if let (Some(id), Some(role), Some(text), Some(ts)) = (
+                    p["id"].as_u64(),
+                    p["role"].as_str(),
+                    p["text"].as_str(),
+                    p["ts"].as_u64(),
+                ) {
+                    self.next_msg_id = self.next_msg_id.max(id);
+                    self.messages.push_back(Message {
+                        id,
+                        role: role.to_string(),
+                        text: text.to_string(),
+                        ts,
+                        reactions: BTreeMap::new(), // rebuilt by reaction_add events
+                    });
+                }
+            }
+            "message_deleted" => {
+                if let Some(id) = p["id"].as_u64() {
+                    self.messages.retain(|m| m.id != id);
+                    self.reaction_users.retain(|(mid, _), _| *mid != id);
+                }
+            }
+            "question" => {
+                if let (Some(id), Some(text)) = (p["id"].as_u64(), p["text"].as_str()) {
+                    self.next_question_id = self.next_question_id.max(id);
+                    self.questions.push(Question {
+                        id,
+                        text: text.to_string(),
+                        votes: 0, // rebuilt by vote_add/vote_remove
+                        pinned: false,
+                        answered: false,
+                    });
+                }
+            }
+            "vote_add" => {
+                if let (Some(qid), Some(voter)) = (p["question_id"].as_u64(), p["voter"].as_str())
+                    && self
+                        .question_voters
+                        .entry(qid)
+                        .or_default()
+                        .insert(voter.to_string())
+                        && let Some(q) = self.questions.iter_mut().find(|q| q.id == qid) {
+                            q.votes += 1;
+                        }
+            }
+            "vote_remove" => {
+                if let (Some(qid), Some(voter)) = (p["question_id"].as_u64(), p["voter"].as_str())
+                    && self.question_voters.entry(qid).or_default().remove(voter)
+                        && let Some(q) = self.questions.iter_mut().find(|q| q.id == qid) {
+                            q.votes = q.votes.saturating_sub(1);
+                        }
+            }
+            "question_pinned" => {
+                if let (Some(qid), Some(pinned)) =
+                    (p["question_id"].as_u64(), p["pinned"].as_bool())
+                {
+                    for q in self.questions.iter_mut() {
+                        q.pinned = if pinned { q.id == qid } else { false };
+                    }
+                }
+            }
+            "question_answered" => {
+                if let Some(qid) = p["question_id"].as_u64()
+                    && let Some(q) = self.questions.iter_mut().find(|q| q.id == qid) {
+                        q.answered = true;
+                        q.pinned = false;
+                    }
+            }
+            "question_dismissed" => {
+                if let Some(qid) = p["question_id"].as_u64() {
+                    self.questions.retain(|q| q.id != qid);
+                    self.question_voters.remove(&qid);
+                }
+            }
+            "reaction_add" => {
+                if let (Some(mid), Some(emoji), Some(voter)) = (
+                    p["message_id"].as_u64(),
+                    p["emoji"].as_str().map(str::to_string),
+                    p["voter"].as_str(),
+                ) {
+                    let users = self.reaction_users.entry((mid, emoji.clone())).or_default();
+                    users.insert(voter.to_string());
+                    let count = users.len() as u32;
+                    if let Some(msg) = self.messages.iter_mut().find(|m| m.id == mid) {
+                        msg.reactions.insert(emoji, count);
+                    }
+                }
+            }
+            "reaction_remove" => {
+                if let (Some(mid), Some(emoji), Some(voter)) = (
+                    p["message_id"].as_u64(),
+                    p["emoji"].as_str().map(str::to_string),
+                    p["voter"].as_str(),
+                )
+                    && let Some(users) = self.reaction_users.get_mut(&(mid, emoji.clone())) {
+                        users.remove(voter);
+                        let count = users.len() as u32;
+                        if let Some(msg) = self.messages.iter_mut().find(|m| m.id == mid) {
+                            if count == 0 {
+                                msg.reactions.remove(&emoji);
+                            } else {
+                                msg.reactions.insert(emoji.clone(), count);
+                            }
+                        }
+                        if count == 0 {
+                            self.reaction_users.remove(&(mid, emoji));
+                        }
+                    }
+            }
+            "poll_created" => {
+                if let (Some(id), Some(question)) = (p["id"].as_u64(), p["question"].as_str()) {
+                    let options: Vec<PollOption> = p["options"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|o| o["text"].as_str())
+                                .map(|t| PollOption {
+                                    text: t.to_string(),
+                                    votes: 0,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !options.is_empty() {
+                        self.next_poll_id = self.next_poll_id.max(id);
+                        self.polls.push(Poll {
+                            id,
+                            question: question.to_string(),
+                            options,
+                            closed: false,
+                        });
+                    }
+                }
+            }
+            "poll_vote" => {
+                if let (Some(pid), Some(idx), Some(voter)) = (
+                    p["poll_id"].as_u64(),
+                    p["option_index"].as_u64().map(|i| i as usize),
+                    p["voter"].as_str(),
+                )
+                    && self
+                        .poll_voters
+                        .entry(pid)
+                        .or_default()
+                        .insert(voter.to_string())
+                        && let Some(poll) = self.polls.iter_mut().find(|p| p.id == pid)
+                            && idx < poll.options.len() {
+                                poll.options[idx].votes += 1;
+                            }
+            }
+            "poll_closed" => {
+                if let Some(pid) = p["poll_id"].as_u64()
+                    && let Some(poll) = self.polls.iter_mut().find(|p| p.id == pid) {
+                        poll.closed = true;
+                    }
+            }
+            "poll_deleted" => {
+                if let Some(pid) = p["poll_id"].as_u64() {
+                    self.polls.retain(|p| p.id != pid);
+                    self.poll_voters.remove(&pid);
+                }
+            }
+            "lock" => {
+                if let Some(locked) = p["locked"].as_bool() {
+                    self.locked = locked;
+                    self.locked_until = p["until"].as_u64();
+                    self.lock_epoch += 1;
+                }
+            }
+            _ => {} // unknown kind — forward-compatible, just skip
+        }
     }
 }
